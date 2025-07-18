@@ -36,4 +36,5 @@ mcp-server-qdrant = "mcp_server_qdrant.main:main"
 testpaths = ["tests"]
 python_files = "test_*.py"
 python_functions = "test_*"
+addopts = "--asyncio-mode=auto"
 asyncio_mode = "auto"

@@ -3288,3 +3288,396 @@ class QdrantMCPServer(FastMCP):
             name="qdrant-collection-info",
             description="獲取 collection 的詳細信息，包括 Qdrant 狀態和 embedding 配置",
         )
+
+        # Schema-Aware Storage Tools
+        async def store_experience(
+            title: Annotated[str, Field(description="經驗的標題")],
+            content: Annotated[str, Field(description="經驗的主要內容")],
+            problem_description: Annotated[str, Field(description="問題描述")],
+            solution_approach: Annotated[str, Field(description="解決方案")],
+            implementation_details: Annotated[str, Field(description="實作細節")],
+            outcomes: Annotated[str, Field(description="結果和成效")],
+            lessons_learned: Annotated[str, Field(description="學到的經驗教訓")],
+            technologies_used: Annotated[List[str], Field(default_factory=list, description="使用的技術")],
+            difficulty_level: Annotated[str, Field(default="medium", description="難度等級: easy, medium, hard")],
+            tags: Annotated[List[str], Field(default_factory=list, description="標籤")],
+            categories: Annotated[List[str], Field(default_factory=list, description="分類")],
+            time_invested: Annotated[Optional[str], Field(None, description="投入時間")],
+            confidence_level: Annotated[float, Field(default=0.8, description="解決方案信心度 (0-1)")],
+            reusability_score: Annotated[float, Field(default=0.7, description="可重用性分數 (0-1)")],
+        ) -> List[str]:
+            """存儲個人經驗記錄，自動驗證 Schema 並標準化內容。"""
+            try:
+                # 權限檢查
+                if not await self.permission_manager.check_tool_permission("store-experience"):
+                    return ["❌ 權限不足：無法使用 store-experience 工具"]
+
+                # 生成唯一 content_id
+                import uuid
+                from datetime import datetime
+                
+                content_id = f"exp_{uuid.uuid4().hex[:12]}"
+                now = datetime.now()
+                
+                # 標準化內容和標籤
+                standardization_result = await self.standardize_content(content=content, tags=tags)
+                
+                # 建立 RAG Entry
+                from mcp_server_qdrant.ragbridge.models import (
+                    RAGEntry, RAGMetadata, ExperienceContent, ContentType, ContentStatus
+                )
+                
+                # 驗證 Schema 1.4.0 要求
+                mandatory_tags = tags if tags else ["experience", "user_generated"]
+                
+                metadata = RAGMetadata(
+                    content_type=ContentType.EXPERIENCE,
+                    content_id=content_id,
+                    title=title,
+                    tags=tags,
+                    categories=categories,
+                    created_at=now,
+                    updated_at=now,
+                    status=ContentStatus.ACTIVE,
+                    custom_fields={"mandatory_tags": mandatory_tags}
+                )
+                
+                structured_content = ExperienceContent(
+                    problem_description=problem_description,
+                    solution_approach=solution_approach,
+                    implementation_details=implementation_details,
+                    outcomes=outcomes,
+                    lessons_learned=lessons_learned,
+                    technologies_used=technologies_used,
+                    difficulty_level=difficulty_level,
+                    time_invested=time_invested,
+                    confidence_level=confidence_level,
+                    reusability_score=reusability_score
+                )
+                
+                entry = RAGEntry(
+                    content=content,
+                    metadata=metadata,
+                    structured_content=structured_content,
+                    search_keywords=tags + categories + technologies_used
+                )
+                
+                # 使用 RAGBridge 存儲
+                result_id = await self.ragbridge_connector.store_rag_entry(entry)
+                
+                return [
+                    f"✅ 成功存儲經驗記錄",
+                    f"📝 ID: {content_id}",
+                    f"🎯 Collection: ragbridge_experience", 
+                    f"🏷️ 標籤: {', '.join(tags)}",
+                    f"📊 難度: {difficulty_level}",
+                    f"🔧 技術: {', '.join(technologies_used)}",
+                    f"💾 Qdrant ID: {result_id}"
+                ]
+                
+            except Exception as e:
+                logger.error(f"Error storing experience: {e}")
+                return [f"❌ 存儲經驗失敗: {str(e)}"]
+
+        self.tool(
+            store_experience,
+            name="store-experience",
+            description="存儲個人經驗記錄，自動驗證 Schema 並標準化內容。使用 ollama-nomic-embed-text embedding。"
+        )
+
+        async def store_process_workflow(
+            title: Annotated[str, Field(description="流程的標題")],
+            content: Annotated[str, Field(description="流程的主要內容描述")],
+            process_name: Annotated[str, Field(description="流程名稱")],
+            process_description: Annotated[str, Field(description="流程詳細描述")],
+            steps: Annotated[List[Dict[str, Any]], Field(description="流程步驟列表，每個步驟包含順序、動作、描述等")],
+            process_type: Annotated[str, Field(default="manual", description="流程類型: manual, automated, hybrid")],
+            estimated_duration: Annotated[Optional[str], Field(None, description="預估執行時間")],
+            prerequisites: Annotated[List[str], Field(default_factory=list, description="前置條件")],
+            success_criteria: Annotated[List[str], Field(default_factory=list, description="成功標準")],
+            common_pitfalls: Annotated[List[str], Field(default_factory=list, description="常見陷阱")],
+            validation_steps: Annotated[List[str], Field(default_factory=list, description="驗證步驟")],
+            tags: Annotated[List[str], Field(default_factory=list, description="標籤")],
+            categories: Annotated[List[str], Field(default_factory=list, description="分類")],
+        ) -> List[str]:
+            """存儲流程工作流程，自動驗證 Schema 並標準化內容。"""
+            try:
+                # 權限檢查
+                if not await self.permission_manager.check_tool_permission("store-process-workflow"):
+                    return ["❌ 權限不足：無法使用 store-process-workflow 工具"]
+
+                # 生成唯一 content_id
+                import uuid
+                from datetime import datetime
+                
+                content_id = f"workflow_{uuid.uuid4().hex[:12]}"
+                now = datetime.now()
+                
+                # 標準化內容和標籤
+                standardization_result = await self.standardize_content(content=content, tags=tags)
+                
+                # 建立 RAG Entry
+                from mcp_server_qdrant.ragbridge.models import (
+                    RAGEntry, RAGMetadata, ProcessWorkflowContent, ContentType, ContentStatus
+                )
+                
+                # 驗證 Schema 1.4.0 要求
+                mandatory_tags = tags if tags else ["workflow", "process", "user_generated"]
+                
+                metadata = RAGMetadata(
+                    content_type=ContentType.PROCESS_WORKFLOW,
+                    content_id=content_id,
+                    title=title,
+                    tags=tags,
+                    categories=categories,
+                    created_at=now,
+                    updated_at=now,
+                    status=ContentStatus.ACTIVE,
+                    custom_fields={"mandatory_tags": mandatory_tags}
+                )
+                
+                structured_content = ProcessWorkflowContent(
+                    process_name=process_name,
+                    process_description=process_description,
+                    steps=steps,
+                    process_type=process_type,
+                    estimated_duration=estimated_duration,
+                    prerequisites=prerequisites,
+                    success_criteria=success_criteria,
+                    common_pitfalls=common_pitfalls,
+                    validation_steps=validation_steps
+                )
+                
+                # 提取步驟關鍵字用於搜尋
+                step_keywords = []
+                for step in steps:
+                    if isinstance(step, dict):
+                        for value in step.values():
+                            if isinstance(value, str):
+                                step_keywords.extend(value.split())
+                
+                entry = RAGEntry(
+                    content=content,
+                    metadata=metadata,
+                    structured_content=structured_content,
+                    search_keywords=tags + categories + [process_name] + step_keywords[:10]  # 限制關鍵字數量
+                )
+                
+                # 使用 RAGBridge 存儲
+                result_id = await self.ragbridge_connector.store_rag_entry(entry)
+                
+                return [
+                    f"✅ 成功存儲流程工作流程",
+                    f"📝 ID: {content_id}",
+                    f"🎯 Collection: ragbridge_process_workflow",
+                    f"🏷️ 標籤: {', '.join(tags)}",
+                    f"⚙️ 流程類型: {process_type}",
+                    f"📋 步驟數: {len(steps)}",
+                    f"⏱️ 預估時間: {estimated_duration or '未指定'}",
+                    f"💾 Qdrant ID: {result_id}"
+                ]
+                
+            except Exception as e:
+                logger.error(f"Error storing process workflow: {e}")
+                return [f"❌ 存儲流程失敗: {str(e)}"]
+
+        self.tool(
+            store_process_workflow,
+            name="store-process-workflow", 
+            description="存儲流程工作流程，自動驗證 Schema 並標準化內容。使用 ollama-nomic-embed-text embedding。"
+        )
+
+        async def store_knowledge_base(
+            title: Annotated[str, Field(description="知識條目的標題")],
+            content: Annotated[str, Field(description="知識的主要內容")],
+            topic: Annotated[str, Field(description="知識主題")],
+            summary: Annotated[str, Field(description="知識摘要")],
+            knowledge_type: Annotated[str, Field(default="factual", description="知識類型: factual, procedural, conceptual")],
+            complexity_level: Annotated[str, Field(default="intermediate", description="複雜度等級: beginner, intermediate, advanced")],
+            references: Annotated[List[str], Field(default_factory=list, description="參考資料")],
+            external_links: Annotated[List[str], Field(default_factory=list, description="外部連結")],
+            tags: Annotated[List[str], Field(default_factory=list, description="標籤")],
+            categories: Annotated[List[str], Field(default_factory=list, description="分類")],
+        ) -> List[str]:
+            """存儲知識庫條目，自動驗證 Schema 並標準化內容。"""
+            try:
+                # 權限檢查
+                if not await self.permission_manager.check_tool_permission("store-knowledge-base"):
+                    return ["❌ 權限不足：無法使用 store-knowledge-base 工具"]
+
+                # 生成唯一 content_id
+                import uuid
+                from datetime import datetime
+                
+                content_id = f"kb_{uuid.uuid4().hex[:12]}"
+                now = datetime.now()
+                
+                # 標準化內容和標籤
+                standardization_result = await self.standardize_content(content=content, tags=tags)
+                
+                # 建立 RAG Entry
+                from mcp_server_qdrant.ragbridge.models import (
+                    RAGEntry, RAGMetadata, KnowledgeBaseContent, ContentType, ContentStatus
+                )
+                
+                # 驗證 Schema 1.4.0 要求
+                mandatory_tags = tags if tags else ["knowledge", topic, knowledge_type]
+                
+                metadata = RAGMetadata(
+                    content_type=ContentType.KNOWLEDGE_BASE,
+                    content_id=content_id,
+                    title=title,
+                    tags=tags,
+                    categories=categories,
+                    created_at=now,
+                    updated_at=now,
+                    status=ContentStatus.ACTIVE,
+                    custom_fields={"mandatory_tags": mandatory_tags}
+                )
+                
+                structured_content = KnowledgeBaseContent(
+                    topic=topic,
+                    content=content,
+                    summary=summary,
+                    knowledge_type=knowledge_type,
+                    complexity_level=complexity_level,
+                    references=references,
+                    external_links=external_links
+                )
+                
+                entry = RAGEntry(
+                    content=content,
+                    metadata=metadata,
+                    structured_content=structured_content,
+                    search_keywords=tags + categories + [topic, knowledge_type, complexity_level]
+                )
+                
+                # 使用 RAGBridge 存儲
+                result_id = await self.ragbridge_connector.store_rag_entry(entry)
+                
+                return [
+                    f"✅ 成功存儲知識庫條目",
+                    f"📝 ID: {content_id}",
+                    f"🎯 Collection: ragbridge_knowledge_base",
+                    f"🏷️ 標籤: {', '.join(tags)}",
+                    f"📚 主題: {topic}",
+                    f"🧠 知識類型: {knowledge_type}",
+                    f"📊 複雜度: {complexity_level}",
+                    f"🔗 參考資料: {len(references)} 個",
+                    f"💾 Qdrant ID: {result_id}"
+                ]
+                
+            except Exception as e:
+                logger.error(f"Error storing knowledge base: {e}")
+                return [f"❌ 存儲知識庫失敗: {str(e)}"]
+
+        self.tool(
+            store_knowledge_base,
+            name="store-knowledge-base",
+            description="存儲知識庫條目，自動驗證 Schema 並標準化內容。使用 ollama-nomic-embed-text embedding。"
+        )
+
+        async def store_decision_record(
+            title: Annotated[str, Field(description="決策記錄的標題")],
+            content: Annotated[str, Field(description="決策記錄的主要內容")],
+            decision_title: Annotated[str, Field(description="決策的標題")],
+            decision_description: Annotated[str, Field(description="決策的詳細描述")],
+            context: Annotated[str, Field(description="導致此決策的背景和情境")],
+            decision_rationale: Annotated[str, Field(description="決策背後的推理")],
+            consequences: Annotated[str, Field(description="預期的後果和影響")],
+            alternatives_considered: Annotated[List[str], Field(default_factory=list, description="考慮過的替代方案")],
+            decision_status: Annotated[str, Field(default="active", description="決策狀態: proposed, active, superseded, deprecated")],
+            decision_date: Annotated[Optional[str], Field(None, description="決策制定日期")],
+            stakeholders: Annotated[List[str], Field(default_factory=list, description="參與決策的相關人員")],
+            impact_level: Annotated[str, Field(default="medium", description="影響程度: low, medium, high, critical")],
+            affected_systems: Annotated[List[str], Field(default_factory=list, description="受影響的系統或組件")],
+            implementation_notes: Annotated[str, Field(default="", description="實施注意事項")],
+            review_date: Annotated[Optional[str], Field(None, description="下次審查日期")],
+            success_metrics: Annotated[List[str], Field(default_factory=list, description="衡量此決策成功的指標")],
+            tags: Annotated[List[str], Field(default_factory=list, description="標籤")],
+            categories: Annotated[List[str], Field(default_factory=list, description="分類")],
+        ) -> List[str]:
+            """存儲決策記錄 (ADR)，自動驗證 Schema 並標準化內容。"""
+            try:
+                # 權限檢查
+                if not await self.permission_manager.check_tool_permission("store-decision-record"):
+                    return ["❌ 權限不足：無法使用 store-decision-record 工具"]
+
+                # 生成唯一 content_id
+                import uuid
+                from datetime import datetime
+                
+                content_id = f"adr_{uuid.uuid4().hex[:12]}"
+                now = datetime.now()
+                
+                # 標準化內容和標籤
+                standardization_result = await self.standardize_content(content=content, tags=tags)
+                
+                # 建立 RAG Entry
+                from mcp_server_qdrant.ragbridge.models import (
+                    RAGEntry, RAGMetadata, DecisionRecordContent, ContentType, ContentStatus
+                )
+                
+                # 驗證 Schema 1.4.0 要求
+                mandatory_tags = tags if tags else ["decision", "adr", decision_status]
+                
+                metadata = RAGMetadata(
+                    content_type=ContentType.DECISION_RECORD,
+                    content_id=content_id,
+                    title=title,
+                    tags=tags,
+                    categories=categories,
+                    created_at=now,
+                    updated_at=now,
+                    status=ContentStatus.ACTIVE,
+                    custom_fields={"mandatory_tags": mandatory_tags}
+                )
+                
+                structured_content = DecisionRecordContent(
+                    decision_title=decision_title,
+                    decision_description=decision_description,
+                    context=context,
+                    alternatives_considered=alternatives_considered,
+                    decision_rationale=decision_rationale,
+                    consequences=consequences,
+                    decision_status=decision_status,
+                    decision_date=decision_date,
+                    stakeholders=stakeholders,
+                    impact_level=impact_level,
+                    affected_systems=affected_systems,
+                    implementation_notes=implementation_notes,
+                    review_date=review_date,
+                    success_metrics=success_metrics
+                )
+                
+                entry = RAGEntry(
+                    content=content,
+                    metadata=metadata,
+                    structured_content=structured_content,
+                    search_keywords=tags + categories + [decision_title, impact_level] + stakeholders + affected_systems
+                )
+                
+                # 使用 RAGBridge 存儲
+                result_id = await self.ragbridge_connector.store_rag_entry(entry)
+                
+                return [
+                    f"✅ 成功存儲決策記錄",
+                    f"📝 ID: {content_id}",
+                    f"🎯 Collection: ragbridge_decision_record",
+                    f"🏷️ 標籤: {', '.join(tags)}",
+                    f"⚖️ 決策狀態: {decision_status}",
+                    f"🎚️ 影響程度: {impact_level}",
+                    f"👥 相關人員: {len(stakeholders)} 人",
+                    f"🖥️ 受影響系統: {len(affected_systems)} 個",
+                    f"💾 Qdrant ID: {result_id}"
+                ]
+                
+            except Exception as e:
+                logger.error(f"Error storing decision record: {e}")
+                return [f"❌ 存儲決策記錄失敗: {str(e)}"]
+
+        self.tool(
+            store_decision_record,
+            name="store-decision-record",
+            description="存儲決策記錄 (ADR)，自動驗證 Schema 並標準化內容。使用 ollama-nomic-embed-text embedding。"
+        )

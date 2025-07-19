@@ -139,6 +139,31 @@ class VocabularyContent(BaseModel):
     standard_source: Optional[str] = Field(None, description="Source of standardization")
 
 
+class DecisionRecordContent(BaseModel):
+    """Structure for decision record content (ADR style)."""
+    
+    decision_title: str = Field(description="Title of the decision")
+    decision_description: str = Field(description="Detailed description of the decision")
+    context: str = Field(description="Context and background that led to this decision")
+    alternatives_considered: List[str] = Field(default_factory=list, description="Alternative options that were considered")
+    decision_rationale: str = Field(description="Reasoning behind the decision")
+    consequences: str = Field(description="Expected consequences and implications")
+    
+    # Decision metadata
+    decision_status: str = Field(default="active", description="Status: proposed, active, superseded, deprecated")
+    decision_date: Optional[str] = Field(None, description="Date when decision was made")
+    stakeholders: List[str] = Field(default_factory=list, description="People involved in the decision")
+    
+    # Impact assessment
+    impact_level: str = Field(default="medium", description="Impact level: low, medium, high, critical")
+    affected_systems: List[str] = Field(default_factory=list, description="Systems or components affected")
+    implementation_notes: str = Field(default="", description="Notes on implementation")
+    
+    # Review and validation
+    review_date: Optional[str] = Field(None, description="Date for next review")
+    success_metrics: List[str] = Field(default_factory=list, description="How to measure success of this decision")
+
+
 class RAGEntry(BaseModel):
     """Complete RAG entry structure."""
     
@@ -151,6 +176,7 @@ class RAGEntry(BaseModel):
         ProcessWorkflowContent, 
         KnowledgeBaseContent,
         VocabularyContent,
+        DecisionRecordContent,
         Dict[str, Any]
     ] = Field(description="Structured content based on type")
     

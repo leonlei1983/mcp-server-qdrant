@@ -21,6 +21,10 @@ from mcp_server_qdrant.system_monitor import UniversalQdrantMonitor
 from mcp_server_qdrant.storage_optimizer import QdrantStorageOptimizer
 from mcp_server_qdrant.ragbridge.connector import RAGBridgeConnector
 from mcp_server_qdrant.ragbridge.models import ContentType, SearchContext, RAGEntry, RAGMetadata
+from mcp_server_qdrant.ragbridge.vocabulary_api import vocabulary_api
+from mcp_server_qdrant.ragbridge.fragment_manager import fragment_manager
+from mcp_server_qdrant.ragbridge.schema_api import schema_api
+from mcp_server_qdrant.ragbridge.schema_approval import get_approval_manager
 
 logger = logging.getLogger(__name__)
 
@@ -1649,4 +1653,936 @@ class QdrantMCPServer(FastMCP):
                 update_experience,
                 name="update-experience",
                 description="更新經驗反饋，包括使用統計和品質評分",
+            )
+
+        # 詞彙管理工具集 (Task 141)
+        async def search_vocabulary(
+            ctx: Context,
+            query: Annotated[str, Field(description="搜尋詞彙的查詢字串")] = "",
+            domain: Annotated[str | None, Field(description="詞彙領域過濾")] = None,
+            status: Annotated[str | None, Field(description="詞彙狀態過濾")] = None,
+            limit: Annotated[int, Field(description="最多返回結果數量")] = 10,
+        ) -> list[str]:
+            """
+            搜尋和瀏覽標準化詞彙庫，支援領域和狀態過濾。
+            """
+            await ctx.debug(f"Searching vocabulary for: {query}")
+            
+            try:
+                result = await vocabulary_api.search_vocabulary(
+                    query=query,
+                    domain=domain,
+                    status=status,
+                    limit=limit
+                )
+                
+                if "error" in result:
+                    return [f"❌ 搜尋詞彙失敗: {result['error']}"]
+                
+                formatted_result = [f"🔍 詞彙搜尋結果 '{query}' ({result['total_results']} 個結果):"]
+                formatted_result.append("")
+                
+                for idx, vocab in enumerate(result['results'], 1):
+                    formatted_result.append(f"**{idx}. {vocab['term']}** ({vocab['match_type']})")
+                    formatted_result.append(f"   📂 領域: {vocab['domain']}")
+                    formatted_result.append(f"   📊 狀態: {vocab['status']}")
+                    formatted_result.append(f"   📈 使用次數: {vocab['usage_count']}")
+                    
+                    if vocab['synonyms']:
+                        formatted_result.append(f"   🔗 同義詞: {', '.join(vocab['synonyms'])}")
+                    
+                    if vocab['definition']:
+                        formatted_result.append(f"   📝 定義: {vocab['definition']}")
+                    
+                    formatted_result.append("")
+                
+                return formatted_result
+                
+            except Exception as e:
+                logger.error(f"Search vocabulary failed: {e}")
+                return [f"❌ 搜尋詞彙失敗: {str(e)}"]
+
+        async def propose_vocabulary(
+            ctx: Context,
+            term: Annotated[str, Field(description="提議的新詞彙")],
+            domain: Annotated[str, Field(description="詞彙所屬領域")],
+            definition: Annotated[str, Field(description="詞彙定義")] = "",
+            synonyms: Annotated[list[str] | None, Field(description="同義詞列表")] = None,
+        ) -> str:
+            """
+            提議新的標準化詞彙項目，需要後續審核批准。
+            """
+            await ctx.debug(f"Proposing new vocabulary term: {term}")
+            
+            try:
+                result = await vocabulary_api.propose_vocabulary(
+                    term=term,
+                    domain=domain,
+                    definition=definition,
+                    synonyms=synonyms or []
+                )
+                
+                if result['success']:
+                    return f"✅ {result['message']}"
+                else:
+                    return f"❌ {result['message']}"
+                    
+            except Exception as e:
+                logger.error(f"Propose vocabulary failed: {e}")
+                return f"❌ 提議詞彙失敗: {str(e)}"
+
+        async def standardize_content(
+            ctx: Context,
+            content: Annotated[str, Field(description="要標準化的內容文本")],
+            tags: Annotated[list[str] | None, Field(description="內容標籤列表")] = None,
+        ) -> list[str]:
+            """
+            標準化內容和標籤，提供詞彙建議和優化。
+            """
+            await ctx.debug(f"Standardizing content: {content[:100]}...")
+            
+            try:
+                result = await vocabulary_api.standardize_content(
+                    content=content,
+                    tags=tags or []
+                )
+                
+                if "error" in result:
+                    return [f"❌ 標準化失敗: {result['error']}"]
+                
+                formatted_result = ["🔧 內容標準化結果:"]
+                formatted_result.append("")
+                
+                # 標籤標準化
+                formatted_result.append("🏷️ **標籤標準化:**")
+                if result['original_tags']:
+                    formatted_result.append(f"   原始: {', '.join(result['original_tags'])}")
+                formatted_result.append(f"   標準化: {', '.join(result['standardized_tags'])}")
+                
+                if result['suggested_additional_tags']:
+                    formatted_result.append(f"   建議新增: {', '.join(result['suggested_additional_tags'])}")
+                formatted_result.append("")
+                
+                # 詞彙建議
+                if result['vocabulary_suggestions']:
+                    formatted_result.append("💡 **詞彙標準化建議:**")
+                    for suggestion in result['vocabulary_suggestions']:
+                        formatted_result.append(f"   • '{suggestion['original']}' → '{suggestion['suggested']}' ({suggestion['reason']})")
+                    formatted_result.append("")
+                
+                # 相關詞彙
+                if result['related_terms']:
+                    formatted_result.append("🔗 **相關詞彙:**")
+                    formatted_result.append(f"   {', '.join(result['related_terms'])}")
+                
+                return formatted_result
+                
+            except Exception as e:
+                logger.error(f"Standardize content failed: {e}")
+                return [f"❌ 標準化內容失敗: {str(e)}"]
+
+        async def get_vocabulary_statistics(ctx: Context) -> list[str]:
+            """
+            獲取詞彙管理系統的統計資訊和健康狀態。
+            """
+            await ctx.debug("Getting vocabulary statistics")
+            
+            try:
+                result = await vocabulary_api.get_vocabulary_statistics()
+                
+                if "error" in result:
+                    return [f"❌ 獲取統計失敗: {result['error']}"]
+                
+                vocab_stats = result['vocabulary_statistics']
+                fragment_stats = result['fragment_statistics']
+                health = result['system_health']
+                
+                formatted_result = ["📊 **詞彙管理系統統計**"]
+                formatted_result.append("")
+                
+                # 詞彙統計
+                formatted_result.append("📚 **詞彙庫統計:**")
+                formatted_result.append(f"   總詞彙數: {vocab_stats['total_terms']}")
+                formatted_result.append(f"   同義詞數: {vocab_stats['total_synonyms']}")
+                formatted_result.append(f"   總使用次數: {vocab_stats['total_usage']}")
+                formatted_result.append(f"   平均使用次數: {vocab_stats['average_usage']:.1f}")
+                formatted_result.append("")
+                
+                # 領域分佈
+                formatted_result.append("🗂️ **領域分佈:**")
+                for domain, count in vocab_stats['domain_distribution'].items():
+                    if count > 0:
+                        formatted_result.append(f"   {domain}: {count} 個詞彙")
+                formatted_result.append("")
+                
+                # 狀態分佈
+                formatted_result.append("📈 **詞彙狀態:**")
+                for status, count in vocab_stats['status_distribution'].items():
+                    if count > 0:
+                        formatted_result.append(f"   {status}: {count} 個詞彙")
+                formatted_result.append("")
+                
+                # 最常用詞彙
+                if vocab_stats['most_used_terms']:
+                    formatted_result.append("🔥 **最常用詞彙:**")
+                    for term in vocab_stats['most_used_terms'][:5]:
+                        formatted_result.append(f"   • {term['term']} ({term['domain']}) - {term['usage_count']} 次")
+                    formatted_result.append("")
+                
+                # 分片統計
+                formatted_result.append("📄 **分片統計:**")
+                formatted_result.append(f"   總分片數: {fragment_stats['total_fragments']}")
+                formatted_result.append(f"   平均品質: {fragment_stats['average_quality']:.2f}")
+                formatted_result.append(f"   總使用次數: {fragment_stats['total_usage']}")
+                formatted_result.append("")
+                
+                # 系統健康
+                formatted_result.append("💚 **系統健康:**")
+                formatted_result.append(f"   詞彙覆蓋率: {health['vocabulary_coverage']:.1%}")
+                formatted_result.append(f"   使用活躍度: {health['usage_activity']:.1%}")
+                formatted_result.append(f"   領域多樣性: {health['domain_diversity']:.1%}")
+                
+                return formatted_result
+                
+            except Exception as e:
+                logger.error(f"Get vocabulary statistics failed: {e}")
+                return [f"❌ 獲取統計失敗: {str(e)}"]
+
+        async def manage_fragment_vocabulary(
+            ctx: Context,
+            action: Annotated[str, Field(description="操作類型: search, create, analyze")],
+            fragment_type: Annotated[str | None, Field(description="分片類型過濾")] = None,
+            query: Annotated[str, Field(description="搜尋查詢")] = "",
+            limit: Annotated[int, Field(description="結果限制")] = 5,
+        ) -> list[str]:
+            """
+            管理分片詞彙，包括搜尋、創建和分析分片。
+            """
+            await ctx.debug(f"Managing fragment vocabulary: {action}")
+            
+            try:
+                if action == "search":
+                    # 搜尋分片
+                    search_params = {"limit": limit}
+                    if query:
+                        search_params["query"] = query
+                    if fragment_type:
+                        # 這裡需要轉換字符串到枚舉
+                        from mcp_server_qdrant.ragbridge.vocabulary import FragmentType
+                        try:
+                            ftype = FragmentType(fragment_type)
+                            search_params["fragment_types"] = [ftype]
+                        except ValueError:
+                            return [f"❌ 無效的分片類型: {fragment_type}"]
+                    
+                    results = fragment_manager.search_fragments(**search_params)
+                    
+                    formatted_result = [f"🔍 分片搜尋結果 ({len(results)} 個):"]
+                    formatted_result.append("")
+                    
+                    for idx, item in enumerate(results, 1):
+                        fragment = item['fragment']
+                        score = item['relevance_score']
+                        
+                        formatted_result.append(f"**{idx}. {fragment['title']}**")
+                        formatted_result.append(f"   📝 類型: {fragment['fragment_type']}")
+                        formatted_result.append(f"   🎯 相關性: {score:.2f}")
+                        formatted_result.append(f"   📊 品質: {fragment['quality_score']:.2f}")
+                        formatted_result.append(f"   🏷️ 標籤: {', '.join(fragment['tags'])}")
+                        formatted_result.append(f"   📈 使用: {fragment['usage_count']} 次")
+                        
+                        # 相關分片
+                        if item['related_fragments']:
+                            related_info = [f"{r[1]}({r[2]:.1f})" for r in item['related_fragments'][:2]]
+                            formatted_result.append(f"   🔗 相關: {', '.join(related_info)}")
+                        
+                        formatted_result.append("")
+                
+                elif action == "analyze":
+                    # 分析分片統計
+                    stats = fragment_manager.get_fragment_statistics()
+                    
+                    formatted_result = ["📊 **分片詞彙分析**"]
+                    formatted_result.append("")
+                    
+                    formatted_result.append(f"📄 總分片數: {stats['total_fragments']}")
+                    formatted_result.append(f"📈 總使用次數: {stats['total_usage']}")
+                    formatted_result.append(f"📊 平均品質: {stats['average_quality']:.2f}")
+                    formatted_result.append(f"🏷️ 總標籤數: {stats['total_tags']}")
+                    formatted_result.append(f"🔑 總關鍵詞: {stats['total_keywords']}")
+                    formatted_result.append("")
+                    
+                    formatted_result.append("📝 **類型分佈:**")
+                    for ftype, count in stats['type_distribution'].items():
+                        if count > 0:
+                            formatted_result.append(f"   {ftype}: {count}")
+                    formatted_result.append("")
+                    
+                    formatted_result.append("🗂️ **領域分佈:**")
+                    for domain, count in stats['domain_distribution'].items():
+                        if count > 0:
+                            formatted_result.append(f"   {domain}: {count}")
+                
+                else:
+                    return [f"❌ 不支援的操作: {action}"]
+                
+                return formatted_result
+                
+            except Exception as e:
+                logger.error(f"Manage fragment vocabulary failed: {e}")
+                return [f"❌ 管理分片詞彙失敗: {str(e)}"]
+
+        # 註冊詞彙管理工具
+        self.tool(
+            search_vocabulary,
+            name="search-vocabulary",
+            description="搜尋和瀏覽標準化詞彙庫，支援領域和狀態過濾",
+        )
+        
+        self.tool(
+            standardize_content,
+            name="standardize-content",
+            description="標準化內容和標籤，提供詞彙建議和優化",
+        )
+        
+        self.tool(
+            get_vocabulary_statistics,
+            name="get-vocabulary-statistics",
+            description="獲取詞彙管理系統的統計資訊和健康狀態",
+        )
+        
+        self.tool(
+            manage_fragment_vocabulary,
+            name="manage-fragment-vocabulary",
+            description="管理分片詞彙，包括搜尋、創建和分析分片",
+        )
+        
+        # 只在非唯讀模式下註冊編輯工具
+        if not self.qdrant_settings.read_only:
+            self.tool(
+                propose_vocabulary,
+                name="propose-vocabulary",
+                description="提議新的標準化詞彙項目，需要後續審核批准",
+            )
+
+        # Schema 管理工具集 (Task 142)
+        async def get_current_schema(
+            ctx: Context,
+        ) -> list[str]:
+            """
+            獲取當前活躍的 Schema 版本及其詳細資訊。
+            """
+            await ctx.debug("Getting current schema")
+            
+            try:
+                result = await schema_api.get_current_schema()
+                
+                if "error" in result:
+                    return [f"❌ 獲取 Schema 失敗: {result['error']}"]
+                
+                # 格式化輸出
+                output = [
+                    f"📋 **當前 Schema 版本: {result['schema_version']}**",
+                    f"📝 描述: {result['description']}",
+                    f"📅 建立時間: {result['created_at']}",
+                    f"🔄 活躍狀態: {'是' if result['is_active'] else '否'}",
+                    f"🔗 向後兼容: {'是' if result['backward_compatible'] else '否'}",
+                    "",
+                    f"📊 **統計資訊:**",
+                    f"- 總欄位數: {result['total_fields']}",
+                    f"- 核心欄位數: {result['core_fields_count']}",
+                    f"- 已棄用欄位數: {result['deprecated_fields_count']}",
+                    "",
+                    f"🏗️ **欄位定義:**"
+                ]
+                
+                for field_name, field_info in result['fields'].items():
+                    status = "🔴 (已棄用)" if field_info['deprecated'] else "✅"
+                    core = "🔒 (核心)" if field_info['is_core'] else ""
+                    required = "⚠️ (必填)" if field_info['required'] else ""
+                    
+                    output.append(f"- **{field_name}** {status} {core} {required}")
+                    output.append(f"  - 類型: {field_info['type']}")
+                    if field_info['description']:
+                        output.append(f"  - 描述: {field_info['description']}")
+                    output.append(f"  - 新增於版本: {field_info['added_in_version']}")
+                    output.append("")
+                
+                return output
+                
+            except Exception as e:
+                logger.error(f"Get current schema failed: {e}")
+                return [f"❌ 獲取當前 Schema 失敗: {str(e)}"]
+
+        async def request_schema_field_addition(
+            ctx: Context,
+            field_name: Annotated[str, Field(description="欄位名稱")],
+            field_type: Annotated[str, Field(description="欄位類型 (string, integer, float, boolean, datetime, list, dict, json)")],
+            description: Annotated[str, Field(description="欄位描述")] = "",
+            required: Annotated[bool, Field(description="是否為必填欄位")] = False,
+            justification: Annotated[str, Field(description="變更理由說明")] = "",
+            proposed_by: Annotated[str, Field(description="提案者身份")] = "mcp_user",
+            min_length: Annotated[int | None, Field(description="最小長度限制")] = None,
+            max_length: Annotated[int | None, Field(description="最大長度限制")] = None,
+            pattern: Annotated[str | None, Field(description="正則表達式模式")] = None,
+            min_value: Annotated[float | None, Field(description="最小值限制")] = None,
+            max_value: Annotated[float | None, Field(description="最大值限制")] = None,
+            allowed_values: Annotated[list[str] | None, Field(description="允許的值列表")] = None,
+        ) -> list[str]:
+            """
+            請求新增 Schema 欄位，將創建審查請求而非直接執行變更。
+            """
+            await ctx.debug(f"Requesting schema field addition: {field_name}")
+            
+            try:
+                # 組建變更詳情
+                change_details = {
+                    "field_type": field_type,
+                    "description": description,
+                    "required": required
+                }
+                
+                # 組建驗證規則
+                validation_rules = {}
+                if min_length is not None:
+                    validation_rules["min_length"] = min_length
+                if max_length is not None:
+                    validation_rules["max_length"] = max_length
+                if pattern is not None:
+                    validation_rules["pattern"] = pattern
+                if min_value is not None:
+                    validation_rules["min_value"] = min_value
+                if max_value is not None:
+                    validation_rules["max_value"] = max_value
+                if allowed_values is not None:
+                    validation_rules["allowed_values"] = allowed_values
+                
+                if validation_rules:
+                    change_details["validation"] = validation_rules
+                
+                # 創建審查請求
+                approval_manager = get_approval_manager()
+                request_id = approval_manager.create_change_request(
+                    change_type="add_field",
+                    field_name=field_name,
+                    change_details=change_details,
+                    proposed_by=proposed_by,
+                    justification=justification
+                )
+                
+                # 檢查是否已自動核准
+                if request_id in approval_manager.approval_history:
+                    # 已自動執行
+                    executed_request = next(
+                        req for req in approval_manager.approval_history 
+                        if req.request_id == request_id
+                    )
+                    
+                    if executed_request.status == "approved":
+                        return [
+                            f"✅ 低風險變更已自動核准並執行",
+                            f"📋 請求ID: {request_id}",
+                            f"🏗️ 新增欄位: {field_name} ({field_type})",
+                            f"📝 說明: {executed_request.review_comments}"
+                        ]
+                    else:
+                        return [
+                            f"❌ 自動執行失敗",
+                            f"📋 請求ID: {request_id}",
+                            f"💬 錯誤: {executed_request.review_comments}"
+                        ]
+                else:
+                    # 等待審查
+                    pending_request = approval_manager.pending_requests[request_id]
+                    return [
+                        f"📋 **Schema 變更請求已創建**",
+                        f"🆔 請求ID: {request_id}",
+                        f"🏗️ 變更類型: 新增欄位 '{field_name}'",
+                        f"⚠️ 風險級別: {pending_request.risk_level.value}",
+                        f"👥 需要審查級別: {pending_request.required_approval_level.value}",
+                        f"📝 提案理由: {justification}",
+                        "",
+                        f"⏳ **狀態: 等待審查**",
+                        f"💡 使用 'review-schema-request' 工具進行審查",
+                        f"🔍 使用 'list-pending-schema-requests' 查看所有待審查請求"
+                    ]
+                
+            except Exception as e:
+                logger.error(f"Request schema field addition failed: {e}")
+                return [f"❌ 創建 Schema 變更請求失敗: {str(e)}"]
+
+        async def request_schema_field_removal(
+            ctx: Context,
+            field_name: Annotated[str, Field(description="要移除的欄位名稱")],
+            justification: Annotated[str, Field(description="移除理由說明")] = "",
+            proposed_by: Annotated[str, Field(description="提案者身份")] = "mcp_user",
+        ) -> list[str]:
+            """
+            請求移除 Schema 欄位，將創建審查請求（高風險操作）。
+            """
+            await ctx.debug(f"Requesting schema field removal: {field_name}")
+            
+            try:
+                # 創建審查請求
+                approval_manager = get_approval_manager()
+                request_id = approval_manager.create_change_request(
+                    change_type="remove_field",
+                    field_name=field_name,
+                    change_details={"deprecated": True},
+                    proposed_by=proposed_by,
+                    justification=justification
+                )
+                
+                # 移除欄位是高風險操作，不會自動核准
+                pending_request = approval_manager.pending_requests[request_id]
+                return [
+                    f"⚠️ **高風險 Schema 變更請求已創建**",
+                    f"🆔 請求ID: {request_id}",
+                    f"🗑️ 變更類型: 移除欄位 '{field_name}'",
+                    f"🔴 風險級別: {pending_request.risk_level.value}",
+                    f"👥 需要審查級別: {pending_request.required_approval_level.value}",
+                    f"📝 移除理由: {justification}",
+                    "",
+                    f"⏳ **狀態: 等待高級審查**",
+                    f"💡 需要管理員權限進行審查",
+                    f"🔍 使用 'review-schema-request' 工具進行審查"
+                ]
+                
+            except Exception as e:
+                logger.error(f"Request schema field removal failed: {e}")
+                return [f"❌ 創建移除欄位請求失敗: {str(e)}"]
+
+        async def validate_schema_data(
+            ctx: Context,
+            data: Annotated[dict, Field(description="要驗證的數據")],
+            schema_version: Annotated[str | None, Field(description="指定的 Schema 版本")] = None,
+        ) -> list[str]:
+            """
+            驗證數據是否符合 Schema 規範。
+            """
+            await ctx.debug(f"Validating data against schema version: {schema_version or 'current'}")
+            
+            try:
+                result = await schema_api.validate_data(data, schema_version)
+                
+                output = [
+                    f"🔍 **Schema 驗證結果**",
+                    f"📋 使用 Schema 版本: {result['schema_version']}",
+                    f"✅ 驗證結果: {'通過' if result['is_valid'] else '失敗'}",
+                    f"❌ 錯誤數量: {result['error_count']}",
+                    f"💬 {result['message']}"
+                ]
+                
+                if result["validation_errors"]:
+                    output.append("")
+                    output.append("🚨 **驗證錯誤詳情:**")
+                    for i, error in enumerate(result["validation_errors"], 1):
+                        output.append(f"{i}. {error}")
+                
+                return output
+                
+            except Exception as e:
+                logger.error(f"Validate schema data failed: {e}")
+                return [f"❌ Schema 數據驗證失敗: {str(e)}"]
+
+        async def analyze_schema_usage(
+            ctx: Context,
+            data_samples: Annotated[list[dict], Field(description="用於分析的數據樣本列表")],
+        ) -> list[str]:
+            """
+            分析 Schema 使用情況，提供優化建議。
+            """
+            await ctx.debug(f"Analyzing schema usage with {len(data_samples)} samples")
+            
+            try:
+                result = await schema_api.analyze_schema_usage(data_samples)
+                
+                if "error" in result:
+                    return [f"❌ {result['error']}"]
+                
+                summary = result.get("summary", {})
+                
+                output = [
+                    f"📊 **Schema 使用情況分析**",
+                    f"📋 當前 Schema 版本: {result['current_schema_version']}",
+                    f"📦 分析樣本數量: {result['total_samples']}",
+                    f"✅ Schema 合規率: {result['schema_compliance_rate']:.1%}",
+                    f"🎯 合規等級: {summary.get('compliance_level', 'unknown')}",
+                    "",
+                    f"📈 **高使用率欄位 (>80%):**"
+                ]
+                
+                for field in summary.get("high_usage_fields", []):
+                    output.append(f"  - {field}")
+                
+                output.append("")
+                output.append(f"📉 **低使用率欄位 (<20%):**")
+                for field in summary.get("low_usage_fields", []):
+                    output.append(f"  - {field}")
+                
+                if result.get("unknown_fields"):
+                    output.append("")
+                    output.append(f"🔍 **未定義但常用的欄位:**")
+                    for field in result["unknown_fields"]:
+                        output.append(f"  - {field}")
+                
+                if summary.get("suggestions_available"):
+                    output.append("")
+                    output.append("💡 建議使用 get-schema-suggestions 工具獲取詳細改進建議")
+                
+                return output
+                
+            except Exception as e:
+                logger.error(f"Analyze schema usage failed: {e}")
+                return [f"❌ Schema 使用分析失敗: {str(e)}"]
+
+        async def get_schema_suggestions(
+            ctx: Context,
+            data_samples: Annotated[list[dict], Field(description="用於生成建議的數據樣本列表")],
+        ) -> list[str]:
+            """
+            基於數據使用情況獲取 Schema 改進建議。
+            """
+            await ctx.debug(f"Getting schema suggestions based on {len(data_samples)} samples")
+            
+            try:
+                result = await schema_api.get_schema_suggestions(data_samples)
+                
+                if "error" in result:
+                    return [f"❌ {result['error']}"]
+                
+                output = [
+                    f"💡 **Schema 改進建議**",
+                    f"📊 分析基礎: {result['analysis_summary']['total_samples']} 個樣本",
+                    f"📋 Schema 版本: {result['analysis_summary']['schema_version']}",
+                    f"✅ 合規率: {result['analysis_summary']['compliance_rate']:.1%}",
+                    f"🔍 建議數量: {result['suggestion_count']}",
+                    "",
+                    f"📝 {result['message']}"
+                ]
+                
+                if result["suggestions"]:
+                    output.append("")
+                    output.append("🎯 **具體建議:**")
+                    
+                    for i, suggestion in enumerate(result["suggestions"], 1):
+                        priority_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(
+                            suggestion.get("priority", "low"), "⚪"
+                        )
+                        
+                        output.append(f"{i}. {priority_emoji} **{suggestion['type']}**: {suggestion['field_name']}")
+                        output.append(f"   原因: {suggestion['reason']}")
+                        output.append("")
+                else:
+                    output.append("")
+                    output.append("🎉 目前 Schema 設計良好，無需調整！")
+                
+                return output
+                
+            except Exception as e:
+                logger.error(f"Get schema suggestions failed: {e}")
+                return [f"❌ 獲取 Schema 建議失敗: {str(e)}"]
+
+        async def get_schema_evolution_history(
+            ctx: Context,
+        ) -> list[str]:
+            """
+            獲取 Schema 演進歷史記錄。
+            """
+            await ctx.debug("Getting schema evolution history")
+            
+            try:
+                result = await schema_api.get_schema_evolution_history()
+                
+                if "error" in result:
+                    return [f"❌ {result['error']}"]
+                
+                summary = result.get("summary", {})
+                
+                output = [
+                    f"📚 **Schema 演進歷史**",
+                    f"📊 總版本數: {result['total_versions']}",
+                    f"✅ 活躍版本數: {result['active_versions']}",
+                    f"🔄 總遷移數: {result['total_migrations']}",
+                    "",
+                    f"🏁 首個版本: {summary.get('first_version', 'N/A')}",
+                    f"🚀 最新版本: {summary.get('latest_version', 'N/A')}",
+                    f"🔥 變更最多版本: {summary.get('most_changes', 'N/A')}",
+                    "",
+                    f"📋 **版本詳情:**"
+                ]
+                
+                for version_info in result["evolution_history"]:
+                    status = "✅ 活躍" if version_info["is_active"] else "⏸️ 非活躍"
+                    compat = "🔗 兼容" if version_info["backward_compatible"] else "⚠️ 破壞性"
+                    
+                    output.append(f"**版本 {version_info['version']}** {status} {compat}")
+                    output.append(f"  - 描述: {version_info['description']}")
+                    output.append(f"  - 建立時間: {version_info['created_at']}")
+                    output.append(f"  - 欄位數量: {version_info['field_count']}")
+                    
+                    if version_info["migrations"]:
+                        output.append(f"  - 遷移記錄:")
+                        for migration in version_info["migrations"]:
+                            output.append(f"    * {migration['type']}: {migration['field']} (來自 {migration['from_version']})")
+                    
+                    output.append("")
+                
+                return output
+                
+            except Exception as e:
+                logger.error(f"Get schema evolution history failed: {e}")
+                return [f"❌ 獲取 Schema 演進歷史失敗: {str(e)}"]
+
+        # Schema 審查管理工具
+        async def list_pending_schema_requests(
+            ctx: Context,
+            reviewer: Annotated[str, Field(description="審查者身份（用於權限過濾）")] = "admin",
+        ) -> list[str]:
+            """
+            列出所有待審查的 Schema 變更請求。
+            """
+            await ctx.debug(f"Listing pending schema requests for reviewer: {reviewer}")
+            
+            try:
+                approval_manager = get_approval_manager()
+                pending_requests = approval_manager.get_pending_requests(reviewer)
+                
+                if not pending_requests:
+                    return [
+                        "✅ **目前沒有待審查的 Schema 變更請求**",
+                        "🎉 所有變更請求都已處理完成"
+                    ]
+                
+                output = [
+                    f"📋 **待審查的 Schema 變更請求 ({len(pending_requests)} 個)**",
+                    ""
+                ]
+                
+                for i, request in enumerate(pending_requests, 1):
+                    risk_emoji = {
+                        "low": "🟢",
+                        "medium": "🟡", 
+                        "high": "🔴",
+                        "critical": "🚨"
+                    }.get(request["risk_level"], "⚪")
+                    
+                    output.extend([
+                        f"**{i}. 請求 {request['request_id'][:8]}...** {risk_emoji}",
+                        f"   🔧 變更類型: {request['change_type']}",
+                        f"   🏗️ 欄位名稱: {request['field_name']}",
+                        f"   ⚠️ 風險級別: {request['risk_level']}",
+                        f"   👥 需要權限: {request['required_approval_level']}",
+                        f"   👤 提案者: {request['proposed_by']}",
+                        f"   📅 提案時間: {request['proposed_at'][:19]}",
+                        f"   📝 理由: {request['justification'][:100]}{'...' if len(request['justification']) > 100 else ''}",
+                        ""
+                    ])
+                
+                output.extend([
+                    "💡 **審查指令:**",
+                    "✅ 核准: review-schema-request <request_id> approve <reviewer> [comments]",
+                    "❌ 拒絕: review-schema-request <request_id> reject <reviewer> [comments]"
+                ])
+                
+                return output
+                
+            except Exception as e:
+                logger.error(f"List pending schema requests failed: {e}")
+                return [f"❌ 列出待審查請求失敗: {str(e)}"]
+
+        async def review_schema_request(
+            ctx: Context,
+            request_id: Annotated[str, Field(description="要審查的請求ID")],
+            action: Annotated[str, Field(description="審查動作: approve 或 reject")],
+            reviewer: Annotated[str, Field(description="審查者身份")],
+            comments: Annotated[str, Field(description="審查意見")] = "",
+        ) -> list[str]:
+            """
+            審查 Schema 變更請求，進行核准或拒絕。
+            """
+            await ctx.debug(f"Reviewing schema request {request_id}: {action} by {reviewer}")
+            
+            try:
+                if action not in ["approve", "reject"]:
+                    return [f"❌ 無效的審查動作: {action}，請使用 'approve' 或 'reject'"]
+                
+                approval_manager = get_approval_manager()
+                
+                # 檢查請求是否存在
+                if request_id not in approval_manager.pending_requests:
+                    return [
+                        f"❌ 請求不存在: {request_id}",
+                        "🔍 使用 'list-pending-schema-requests' 查看所有待審查請求"
+                    ]
+                
+                # 執行審查
+                success = approval_manager.review_request(
+                    request_id=request_id,
+                    reviewer=reviewer,
+                    action=action,
+                    comments=comments
+                )
+                
+                if not success:
+                    return [
+                        f"❌ 審查失敗: 權限不足或請求不存在",
+                        f"👤 審查者: {reviewer}",
+                        f"📋 請求ID: {request_id}",
+                        "💡 請檢查您的審查權限"
+                    ]
+                
+                # 從歷史記錄中找到審查結果
+                reviewed_request = next(
+                    req for req in approval_manager.approval_history
+                    if req.request_id == request_id
+                )
+                
+                if action == "approve":
+                    if reviewed_request.status == "approved":
+                        return [
+                            f"✅ **Schema 變更請求已核准並執行**",
+                            f"📋 請求ID: {request_id}",
+                            f"🏗️ 變更類型: {reviewed_request.change_type}",
+                            f"🔧 欄位: {reviewed_request.field_name}",
+                            f"👤 審查者: {reviewer}",
+                            f"📝 審查意見: {comments}",
+                            f"⏰ 審查時間: {reviewed_request.reviewed_at.strftime('%Y-%m-%d %H:%M:%S')}",
+                            "",
+                            f"🎉 Schema 變更已成功應用！"
+                        ]
+                    else:
+                        return [
+                            f"❌ **Schema 變更執行失敗**",
+                            f"📋 請求ID: {request_id}",
+                            f"👤 審查者: {reviewer}",
+                            f"💬 錯誤: {reviewed_request.review_comments}",
+                            "🔧 請檢查 Schema 定義是否正確"
+                        ]
+                else:  # reject
+                    return [
+                        f"❌ **Schema 變更請求已拒絕**",
+                        f"📋 請求ID: {request_id}",
+                        f"🏗️ 變更類型: {reviewed_request.change_type}",
+                        f"🔧 欄位: {reviewed_request.field_name}",
+                        f"👤 審查者: {reviewer}",
+                        f"📝 拒絕理由: {comments}",
+                        f"⏰ 審查時間: {reviewed_request.reviewed_at.strftime('%Y-%m-%d %H:%M:%S')}"
+                    ]
+                
+            except Exception as e:
+                logger.error(f"Review schema request failed: {e}")
+                return [f"❌ 審查 Schema 請求失敗: {str(e)}"]
+
+        async def get_schema_approval_history(
+            ctx: Context,
+            limit: Annotated[int, Field(description="返回的歷史記錄數量")] = 10,
+        ) -> list[str]:
+            """
+            獲取 Schema 審查歷史記錄。
+            """
+            await ctx.debug(f"Getting schema approval history (limit: {limit})")
+            
+            try:
+                approval_manager = get_approval_manager()
+                history = approval_manager.get_approval_history(limit)
+                
+                if not history:
+                    return [
+                        "📋 **暫無 Schema 審查歷史記錄**",
+                        "💡 當有 Schema 變更請求時，記錄會顯示在這裡"
+                    ]
+                
+                output = [
+                    f"📚 **Schema 審查歷史記錄 (最近 {len(history)} 個)**",
+                    ""
+                ]
+                
+                for i, record in enumerate(history, 1):
+                    status_emoji = {"approved": "✅", "rejected": "❌"}.get(record["status"], "⏳")
+                    risk_emoji = {
+                        "low": "🟢",
+                        "medium": "🟡",
+                        "high": "🔴", 
+                        "critical": "🚨"
+                    }.get(record["risk_level"], "⚪")
+                    
+                    output.extend([
+                        f"**{i}. 請求 {record['request_id'][:8]}...** {status_emoji} {risk_emoji}",
+                        f"   🔧 變更: {record['change_type']} → {record['field_name']}",
+                        f"   👤 提案者: {record['proposed_by']}",
+                        f"   👥 審查者: {record['reviewed_by'] or 'N/A'}",
+                        f"   📅 提案時間: {record['proposed_at'][:19]}",
+                        f"   ⏰ 審查時間: {record['reviewed_at'][:19] if record['reviewed_at'] else 'N/A'}",
+                        f"   📝 審查意見: {record['review_comments'][:80]}{'...' if len(record['review_comments']) > 80 else ''}",
+                        ""
+                    ])
+                
+                return output
+                
+            except Exception as e:
+                logger.error(f"Get schema approval history failed: {e}")
+                return [f"❌ 獲取審查歷史失敗: {str(e)}"]
+
+        # 註冊 Schema 管理工具
+        self.tool(
+            get_current_schema,
+            name="get-current-schema",
+            description="獲取當前活躍的 Schema 版本及其詳細資訊",
+        )
+        
+        self.tool(
+            validate_schema_data,
+            name="validate-schema-data", 
+            description="驗證數據是否符合 Schema 規範",
+        )
+        
+        self.tool(
+            analyze_schema_usage,
+            name="analyze-schema-usage",
+            description="分析 Schema 使用情況，提供統計資訊",
+        )
+        
+        self.tool(
+            get_schema_suggestions,
+            name="get-schema-suggestions",
+            description="基於數據使用情況獲取 Schema 改進建議",
+        )
+        
+        self.tool(
+            get_schema_evolution_history,
+            name="get-schema-evolution-history",
+            description="獲取 Schema 演進歷史記錄",
+        )
+        
+        self.tool(
+            list_pending_schema_requests,
+            name="list-pending-schema-requests",
+            description="列出所有待審查的 Schema 變更請求",
+        )
+        
+        self.tool(
+            review_schema_request,
+            name="review-schema-request",
+            description="審查 Schema 變更請求，進行核准或拒絕",
+        )
+        
+        self.tool(
+            get_schema_approval_history,
+            name="get-schema-approval-history",
+            description="獲取 Schema 審查歷史記錄",
+        )
+        
+        # 只在非唯讀模式下註冊變更請求工具
+        if not self.qdrant_settings.read_only:
+            self.tool(
+                request_schema_field_addition,
+                name="request-schema-field-addition",
+                description="請求新增 Schema 欄位，將創建審查請求而非直接執行變更",
+            )
+            
+            self.tool(
+                request_schema_field_removal,
+                name="request-schema-field-removal",
+                description="請求移除 Schema 欄位，將創建審查請求（高風險操作）",
             )

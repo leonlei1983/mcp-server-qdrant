@@ -198,7 +198,7 @@ class RAGBridgeConnector(QdrantConnector):
             conditions.append(
                 models.FieldCondition(
                     key="metadata.status",
-                    match=models.MatchExcept(except_=[ContentStatus.EXPERIMENTAL.value])
+                    match=models.MatchExcept(**{"except": [ContentStatus.EXPERIMENTAL.value]})
                 )
             )
         

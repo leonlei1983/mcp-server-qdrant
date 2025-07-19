@@ -19,6 +19,8 @@ from mcp_server_qdrant.settings import (
 )
 from mcp_server_qdrant.system_monitor import UniversalQdrantMonitor
 from mcp_server_qdrant.storage_optimizer import QdrantStorageOptimizer
+from mcp_server_qdrant.ragbridge.connector import RAGBridgeConnector
+from mcp_server_qdrant.ragbridge.models import ContentType, SearchContext, RAGEntry, RAGMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,15 @@ class QdrantMCPServer(FastMCP):
             self.embedding_provider,
             qdrant_settings.local_path,
             make_indexes(qdrant_settings.filterable_fields_dict()),
+        )
+        
+        # Initialize RAG Bridge connector
+        self.ragbridge_connector = RAGBridgeConnector(
+            qdrant_url=qdrant_settings.location,
+            qdrant_api_key=qdrant_settings.api_key,
+            embedding_provider=self.embedding_provider,
+            qdrant_local_path=qdrant_settings.local_path,
+            default_collection_prefix="ragbridge",
         )
         
         # 初始化通用系統監控器
@@ -1305,3 +1316,337 @@ class QdrantMCPServer(FastMCP):
             name="qdrant-analyze-storage", 
             description="分析 Qdrant 的儲存使用情況，提供優化建議。",
         )
+
+        # RAG Bridge 工具集
+        async def search_experience(
+            ctx: Context,
+            query: Annotated[str, Field(description="搜尋個人經驗和知識的查詢")],
+            content_types: Annotated[
+                list[str] | None, 
+                Field(description="要搜尋的內容類型，可選: experience, process_workflow, knowledge_base, vocabulary, decision_record")
+            ] = None,
+            max_results: Annotated[int, Field(description="最多返回的結果數量")] = 5,
+            min_similarity: Annotated[float, Field(description="最低相似度閾值")] = 0.7,
+            include_experimental: Annotated[bool, Field(description="是否包含實驗性內容")] = False,
+        ) -> list[str]:
+            """
+            搜尋個人經驗知識庫，支援多種內容類型和智能排序。
+            """
+            await ctx.debug(f"Searching experience for query: {query}")
+            
+            try:
+                # 轉換內容類型
+                parsed_content_types = []
+                if content_types:
+                    for ct in content_types:
+                        try:
+                            parsed_content_types.append(ContentType(ct))
+                        except ValueError:
+                            await ctx.debug(f"Invalid content type: {ct}")
+                            continue
+                
+                # 建立搜尋上下文
+                search_context = SearchContext(
+                    query=query,
+                    content_types=parsed_content_types if parsed_content_types else None,
+                    max_results=max_results,
+                    min_similarity=min_similarity,
+                    include_experimental=include_experimental,
+                )
+                
+                # 執行搜尋
+                results = await self.ragbridge_connector.search_rag_entries(search_context)
+                
+                if not results:
+                    return [f"沒有找到與查詢 '{query}' 相關的經驗知識"]
+                
+                # 格式化結果
+                formatted_results = [f"🔍 搜尋結果 '{query}' ({len(results)} 個結果):"]
+                formatted_results.append("")
+                
+                for idx, result in enumerate(results, 1):
+                    entry = result.entry
+                    metadata = entry.metadata
+                    
+                    formatted_results.append(f"**{idx}. {metadata.title}**")
+                    formatted_results.append(f"   📝 類型: {metadata.content_type.value}")
+                    formatted_results.append(f"   🎯 相似度: {result.similarity_score:.2f}")
+                    formatted_results.append(f"   📊 品質: {metadata.quality_score:.2f}")
+                    formatted_results.append(f"   📈 使用次數: {metadata.usage_count}")
+                    formatted_results.append(f"   🏷️ 標籤: {', '.join(metadata.tags) if metadata.tags else '無'}")
+                    
+                    # 內容摘要
+                    content_preview = entry.content[:200] + "..." if len(entry.content) > 200 else entry.content
+                    formatted_results.append(f"   📄 內容: {content_preview}")
+                    
+                    # 匹配原因
+                    if result.match_reasons:
+                        formatted_results.append(f"   🎯 匹配原因: {', '.join(result.match_reasons)}")
+                    
+                    # 使用建議
+                    formatted_results.append(f"   💡 建議: {result.usage_recommendation}")
+                    formatted_results.append("")
+                
+                return formatted_results
+                
+            except Exception as e:
+                logger.error(f"Search experience failed: {e}")
+                return [f"❌ 搜尋經驗失敗: {str(e)}"]
+
+        async def get_process_workflow(
+            ctx: Context,
+            workflow_name: Annotated[str, Field(description="工作流程名稱或相關關鍵字")],
+            include_steps: Annotated[bool, Field(description="是否包含詳細步驟")] = True,
+            include_checkpoints: Annotated[bool, Field(description="是否包含檢查點")] = True,
+        ) -> list[str]:
+            """
+            獲取特定流程的工作流程步驟，支援結構化流程展示。
+            """
+            await ctx.debug(f"Getting process workflow for: {workflow_name}")
+            
+            try:
+                # 建立搜尋上下文，專注於流程工作流
+                search_context = SearchContext(
+                    query=workflow_name,
+                    content_types=[ContentType.PROCESS_WORKFLOW],
+                    max_results=3,
+                    min_similarity=0.6,
+                    include_experimental=False,
+                )
+                
+                # 執行搜尋
+                results = await self.ragbridge_connector.search_rag_entries(search_context)
+                
+                if not results:
+                    return [f"沒有找到 '{workflow_name}' 相關的工作流程"]
+                
+                # 格式化結果
+                formatted_results = [f"🔄 工作流程: {workflow_name}"]
+                formatted_results.append("")
+                
+                for idx, result in enumerate(results, 1):
+                    entry = result.entry
+                    metadata = entry.metadata
+                    
+                    formatted_results.append(f"**{idx}. {metadata.title}**")
+                    formatted_results.append(f"   📊 品質評分: {metadata.quality_score:.2f}")
+                    formatted_results.append(f"   ✅ 成功率: {metadata.success_rate:.2f}")
+                    formatted_results.append(f"   🏷️ 標籤: {', '.join(metadata.tags) if metadata.tags else '無'}")
+                    formatted_results.append("")
+                    
+                    # 顯示流程內容
+                    formatted_results.append("📋 **流程內容:**")
+                    formatted_results.append(entry.content)
+                    formatted_results.append("")
+                    
+                    # 顯示結構化內容
+                    if include_steps and entry.structured_content:
+                        structured = entry.structured_content
+                        
+                        if "steps" in structured:
+                            formatted_results.append("📝 **詳細步驟:**")
+                            for step_idx, step in enumerate(structured["steps"], 1):
+                                formatted_results.append(f"   {step_idx}. {step}")
+                            formatted_results.append("")
+                        
+                        if include_checkpoints and "checkpoints" in structured:
+                            formatted_results.append("🎯 **檢查點:**")
+                            for checkpoint in structured["checkpoints"]:
+                                formatted_results.append(f"   • {checkpoint}")
+                            formatted_results.append("")
+                        
+                        if "prerequisites" in structured:
+                            formatted_results.append("🔧 **前置需求:**")
+                            for prereq in structured["prerequisites"]:
+                                formatted_results.append(f"   • {prereq}")
+                            formatted_results.append("")
+                        
+                        if "expected_outcomes" in structured:
+                            formatted_results.append("🎯 **預期結果:**")
+                            for outcome in structured["expected_outcomes"]:
+                                formatted_results.append(f"   • {outcome}")
+                            formatted_results.append("")
+                    
+                    # 語義塊 (如果有)
+                    if entry.semantic_chunks:
+                        formatted_results.append("🧩 **相關概念:**")
+                        for chunk in entry.semantic_chunks[:3]:  # 只顯示前3個
+                            formatted_results.append(f"   • {chunk}")
+                        formatted_results.append("")
+                    
+                    formatted_results.append(f"   💡 使用建議: {result.usage_recommendation}")
+                    formatted_results.append("")
+                
+                return formatted_results
+                
+            except Exception as e:
+                logger.error(f"Get process workflow failed: {e}")
+                return [f"❌ 獲取工作流程失敗: {str(e)}"]
+
+        async def suggest_similar(
+            ctx: Context,
+            reference_content: Annotated[str, Field(description="參考內容或情境描述")],
+            content_type: Annotated[str, Field(description="內容類型")] = "experience",
+            similarity_threshold: Annotated[float, Field(description="相似度閾值")] = 0.6,
+            max_suggestions: Annotated[int, Field(description="最多建議數量")] = 3,
+        ) -> list[str]:
+            """
+            根據參考內容推薦相關的經驗和知識。
+            """
+            await ctx.debug(f"Getting similar suggestions for: {reference_content[:50]}...")
+            
+            try:
+                # 轉換內容類型
+                try:
+                    parsed_content_type = ContentType(content_type)
+                except ValueError:
+                    parsed_content_type = ContentType.EXPERIENCE
+                
+                # 建立搜尋上下文
+                search_context = SearchContext(
+                    query=reference_content,
+                    content_types=[parsed_content_type],
+                    max_results=max_suggestions,
+                    min_similarity=similarity_threshold,
+                    include_experimental=False,
+                )
+                
+                # 執行搜尋
+                results = await self.ragbridge_connector.search_rag_entries(search_context)
+                
+                if not results:
+                    return [f"沒有找到與參考內容相似的 {content_type} 內容"]
+                
+                # 格式化結果
+                formatted_results = [f"🔗 相似內容推薦 ({len(results)} 個):"]
+                formatted_results.append("")
+                
+                for idx, result in enumerate(results, 1):
+                    entry = result.entry
+                    metadata = entry.metadata
+                    
+                    formatted_results.append(f"**{idx}. {metadata.title}**")
+                    formatted_results.append(f"   🎯 相似度: {result.similarity_score:.2f}")
+                    formatted_results.append(f"   📊 品質: {metadata.quality_score:.2f}")
+                    formatted_results.append(f"   📈 使用次數: {metadata.usage_count}")
+                    formatted_results.append(f"   🏷️ 標籤: {', '.join(metadata.tags) if metadata.tags else '無'}")
+                    
+                    # 內容摘要
+                    content_preview = entry.content[:150] + "..." if len(entry.content) > 150 else entry.content
+                    formatted_results.append(f"   📄 摘要: {content_preview}")
+                    
+                    # 相似性原因
+                    if result.match_reasons:
+                        formatted_results.append(f"   🎯 相似原因: {', '.join(result.match_reasons)}")
+                    
+                    # 應用建議
+                    formatted_results.append(f"   💡 如何應用: {result.usage_recommendation}")
+                    formatted_results.append("")
+                
+                return formatted_results
+                
+            except Exception as e:
+                logger.error(f"Suggest similar failed: {e}")
+                return [f"❌ 推薦相似內容失敗: {str(e)}"]
+
+        async def update_experience(
+            ctx: Context,
+            content_id: Annotated[str, Field(description="內容ID")],
+            content_type: Annotated[str, Field(description="內容類型")] = "experience",
+            feedback_type: Annotated[str, Field(description="反饋類型: success, failure, improvement")] = "success",
+            feedback_notes: Annotated[str, Field(description="反饋詳細說明")] = "",
+            quality_adjustment: Annotated[float, Field(description="品質調整 (-1.0 到 1.0)")] = 0.0,
+        ) -> str:
+            """
+            更新經驗反饋，包括使用統計和品質評分。
+            """
+            await ctx.debug(f"Updating experience feedback for: {content_id}")
+            
+            try:
+                # 轉換內容類型
+                try:
+                    parsed_content_type = ContentType(content_type)
+                except ValueError:
+                    return f"❌ 無效的內容類型: {content_type}"
+                
+                # 獲取現有內容
+                existing_content = await self.ragbridge_connector.get_content_by_id(
+                    content_id, parsed_content_type
+                )
+                
+                if not existing_content:
+                    return f"❌ 找不到內容 ID: {content_id}"
+                
+                # 準備更新資料
+                current_metadata = existing_content.metadata
+                updates = {
+                    "updated_at": datetime.now().isoformat(),
+                    "usage_count": current_metadata.usage_count + 1,
+                }
+                
+                # 根據反饋類型更新統計
+                if feedback_type == "success":
+                    new_success_count = getattr(current_metadata, 'success_count', 0) + 1
+                    total_usage = updates["usage_count"]
+                    updates["success_rate"] = new_success_count / total_usage if total_usage > 0 else 0.0
+                    updates["success_count"] = new_success_count
+                elif feedback_type == "failure":
+                    failure_count = getattr(current_metadata, 'failure_count', 0) + 1
+                    updates["failure_count"] = failure_count
+                    success_count = getattr(current_metadata, 'success_count', 0)
+                    total_usage = updates["usage_count"]
+                    updates["success_rate"] = success_count / total_usage if total_usage > 0 else 0.0
+                
+                # 調整品質分數
+                if quality_adjustment != 0.0:
+                    new_quality = max(0.0, min(1.0, current_metadata.quality_score + quality_adjustment))
+                    updates["quality_score"] = new_quality
+                
+                # 添加反饋記錄
+                if feedback_notes:
+                    feedback_history = getattr(current_metadata, 'feedback_history', [])
+                    feedback_history.append({
+                        "timestamp": datetime.now().isoformat(),
+                        "type": feedback_type,
+                        "notes": feedback_notes,
+                        "quality_adjustment": quality_adjustment,
+                    })
+                    updates["feedback_history"] = feedback_history
+                
+                # 更新內容
+                await self.ragbridge_connector.update_content_metadata(
+                    content_id, parsed_content_type, updates
+                )
+                
+                return f"✅ 已更新 {content_id} 的反饋資料 (類型: {feedback_type})"
+                
+            except Exception as e:
+                logger.error(f"Update experience failed: {e}")
+                return f"❌ 更新經驗反饋失敗: {str(e)}"
+
+        # 註冊 RAG Bridge 工具
+        self.tool(
+            search_experience,
+            name="search-experience",
+            description="搜尋個人經驗知識庫，支援多種內容類型和智能排序",
+        )
+        
+        self.tool(
+            get_process_workflow,
+            name="get-process-workflow",
+            description="獲取特定流程的工作流程步驟，支援結構化流程展示",
+        )
+        
+        self.tool(
+            suggest_similar,
+            name="suggest-similar",
+            description="根據參考內容推薦相關的經驗和知識",
+        )
+        
+        # 只在非唯讀模式下註冊更新工具
+        if not self.qdrant_settings.read_only:
+            self.tool(
+                update_experience,
+                name="update-experience",
+                description="更新經驗反饋，包括使用統計和品質評分",
+            )

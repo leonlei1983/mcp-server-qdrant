@@ -25,6 +25,8 @@ from mcp_server_qdrant.ragbridge.vocabulary_api import vocabulary_api
 from mcp_server_qdrant.ragbridge.fragment_manager import fragment_manager
 from mcp_server_qdrant.ragbridge.schema_api import schema_api
 from mcp_server_qdrant.ragbridge.schema_approval import get_approval_manager
+from mcp_server_qdrant.permission_manager import get_permission_manager, PermissionLevel
+from mcp_server_qdrant.data_migration_tool import DataMigrationTool
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +80,27 @@ class QdrantMCPServer(FastMCP):
         self.storage_optimizer = QdrantStorageOptimizer(
             self.qdrant_connector._client
         )
+        
+        # 初始化權限管理系統
+        self.permission_manager = get_permission_manager()
+        if qdrant_settings.enable_permission_system:
+            # 設定預設權限級別
+            default_level = PermissionLevel(qdrant_settings.default_permission_level)
+            self.permission_manager.set_user_permission("default_user", default_level)
+            logger.info(f"Permission system enabled with default level: {default_level.value}")
+        else:
+            # 向後兼容：如果停用權限系統，設定為超級管理員
+            self.permission_manager.set_user_permission("default_user", PermissionLevel.SUPER_ADMIN)
+            logger.info("Permission system disabled - granting super_admin access")
+        
+        # 初始化資料遷移工具
+        from mcp_server_qdrant.ragbridge.vocabulary import VocabularyManager
+        vocabulary_manager = VocabularyManager()
+        self.migration_tool = DataMigrationTool(
+            qdrant_client=self.qdrant_connector._client,
+            ragbridge_connector=self.ragbridge_connector,
+            vocabulary_manager=vocabulary_manager
+        )
 
         super().__init__(name=name, instructions=instructions, **settings)
 
@@ -89,6 +112,37 @@ class QdrantMCPServer(FastMCP):
         """
         entry_metadata = json.dumps(entry.metadata) if entry.metadata else ""
         return f"<entry><content>{entry.content}</content><metadata>{entry_metadata}</metadata></entry>"
+    
+    def check_permission_wrapper(self, func, tool_name: str):
+        """
+        包裝工具函數以添加權限檢查
+        """
+        async def permission_checked_func(ctx: Context, *args, **kwargs):
+            # 獲取用戶ID（在實際使用中可能來自 context 或認證系統）
+            user_id = "default_user"  # 目前使用預設用戶
+            
+            # 檢查權限
+            if not self.permission_manager.check_tool_permission(user_id, tool_name):
+                permission_level = self.permission_manager.get_user_permission(user_id)
+                required_permission = self.permission_manager.tool_permissions.get(tool_name)
+                required_level = required_permission.required_level.value if required_permission else "unknown"
+                
+                await ctx.debug(f"Permission denied: User {user_id} (level: {permission_level.value}) trying to access {tool_name} (requires: {required_level})")
+                return [
+                    f"❌ **權限不足**",
+                    f"🔐 工具名稱: {tool_name}",
+                    f"👤 當前權限級別: {permission_level.value}",
+                    f"⚠️ 需要權限級別: {required_level}",
+                    "",
+                    f"💡 **解決方案:**",
+                    f"請聯絡管理員提升權限級別，或使用適合您權限的工具。",
+                    f"使用 'get-user-permissions' 工具查看可用的工具列表。"
+                ]
+            
+            # 權限檢查通過，執行原始函數
+            return await func(ctx, *args, **kwargs)
+        
+        return permission_checked_func
 
     def setup_tools(self):
         """
@@ -2586,3 +2640,651 @@ class QdrantMCPServer(FastMCP):
                 name="request-schema-field-removal",
                 description="請求移除 Schema 欄位，將創建審查請求（高風險操作）",
             )
+
+        # 權限管理工具集 - 所有用戶都可以查看權限狀態
+        async def get_user_permissions(ctx: Context) -> list[str]:
+            """
+            獲取當前用戶的權限摘要和可用工具列表。
+            """
+            await ctx.debug("Getting user permissions")
+            
+            try:
+                user_id = "default_user"  # 目前使用預設用戶
+                summary = self.permission_manager.get_permission_summary(user_id)
+                
+                output = [
+                    f"👤 **用戶權限資訊**",
+                    f"🆔 用戶ID: {summary['user_id']}",
+                    f"🔐 權限級別: {summary['permission_level']}",
+                    f"🛠️ 可用工具總數: {summary['total_available_tools']}",
+                    "",
+                    f"🎯 **可執行操作類型:**"
+                ]
+                
+                for operation in summary['available_operations']:
+                    output.append(f"  ✅ {operation}")
+                
+                output.append("")
+                output.append(f"🛠️ **按風險級別分類的可用工具:**")
+                
+                for risk_level, tools in summary['tools_by_risk'].items():
+                    if tools:
+                        risk_emoji = {"low": "🟢", "medium": "🟡", "critical": "🔴"}.get(risk_level, "⚪")
+                        output.append(f"  {risk_emoji} **{risk_level.upper()} 風險 ({len(tools)} 個):**")
+                        for tool in sorted(tools):
+                            output.append(f"    - {tool}")
+                        output.append("")
+                
+                if summary['permission_level'] == 'user':
+                    output.append("💡 **提升權限:**")
+                    output.append("如需使用管理功能，請聯絡管理員提升權限級別至 admin 或 super_admin")
+                
+                return output
+                
+            except Exception as e:
+                logger.error(f"Get user permissions failed: {e}")
+                return [f"❌ 獲取權限資訊失敗: {str(e)}"]
+
+        async def check_tool_permission(
+            ctx: Context,
+            tool_name: Annotated[str, Field(description="要檢查的工具名稱")],
+        ) -> list[str]:
+            """
+            檢查特定工具的使用權限。
+            """
+            await ctx.debug(f"Checking permission for tool: {tool_name}")
+            
+            try:
+                user_id = "default_user"
+                has_permission = self.permission_manager.check_tool_permission(user_id, tool_name)
+                user_level = self.permission_manager.get_user_permission(user_id)
+                tool_permission = self.permission_manager.tool_permissions.get(tool_name)
+                
+                if not tool_permission:
+                    return [
+                        f"❓ **工具權限查詢**",
+                        f"🔧 工具名稱: {tool_name}",
+                        f"⚠️ 狀態: 未定義的工具",
+                        f"💬 說明: 此工具可能不存在或未在權限系統中註冊"
+                    ]
+                
+                permission_emoji = "✅" if has_permission else "❌"
+                risk_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴", "critical": "🚨"}.get(
+                    tool_permission.risk_level, "⚪"
+                )
+                
+                output = [
+                    f"🔍 **工具權限檢查結果**",
+                    f"🔧 工具名稱: {tool_name}",
+                    f"{permission_emoji} 使用權限: {'允許' if has_permission else '拒絕'}",
+                    f"👤 當前權限級別: {user_level.value}",
+                    f"⚠️ 需要權限級別: {tool_permission.required_level.value}",
+                    f"{risk_emoji} 風險級別: {tool_permission.risk_level}",
+                    f"📝 工具說明: {tool_permission.description}",
+                ]
+                
+                if not has_permission:
+                    output.append("")
+                    output.append("💡 **解決方案:**")
+                    if tool_permission.required_level == PermissionLevel.ADMIN:
+                        output.append("需要 admin 權限，請聯絡管理員提升權限級別")
+                    elif tool_permission.required_level == PermissionLevel.SUPER_ADMIN:
+                        output.append("需要 super_admin 權限，此為高風險操作，需要最高管理員權限")
+                
+                return output
+                
+            except Exception as e:
+                logger.error(f"Check tool permission failed: {e}")
+                return [f"❌ 檢查工具權限失敗: {str(e)}"]
+
+        # 註冊權限管理工具
+        self.tool(
+            get_user_permissions,
+            name="get-user-permissions",
+            description="獲取當前用戶的權限摘要和可用工具列表",
+        )
+        
+        self.tool(
+            check_tool_permission,
+            name="check-tool-permission",
+            description="檢查特定工具的使用權限",
+        )
+
+        # 只有 super_admin 可以管理權限
+        async def set_user_permission_level(
+            ctx: Context,
+            user_id: Annotated[str, Field(description="要設定的用戶ID")],
+            permission_level: Annotated[str, Field(description="權限級別: user, admin, super_admin")],
+        ) -> str:
+            """
+            設定用戶的權限級別（僅限超級管理員）。
+            """
+            await ctx.debug(f"Setting user {user_id} permission to {permission_level}")
+            
+            try:
+                # 檢查當前用戶是否有權限執行此操作
+                current_user = "default_user"
+                current_level = self.permission_manager.get_user_permission(current_user)
+                
+                if current_level != PermissionLevel.SUPER_ADMIN:
+                    return f"❌ 權限不足：只有 super_admin 可以管理用戶權限（當前級別: {current_level.value}）"
+                
+                # 驗證權限級別
+                try:
+                    new_level = PermissionLevel(permission_level)
+                except ValueError:
+                    return f"❌ 無效的權限級別: {permission_level}，請使用: user, admin, super_admin"
+                
+                # 設定權限
+                self.permission_manager.set_user_permission(user_id, new_level)
+                
+                return f"✅ 成功設定用戶 {user_id} 的權限級別為 {new_level.value}"
+                
+            except Exception as e:
+                logger.error(f"Set user permission failed: {e}")
+                return f"❌ 設定用戶權限失敗: {str(e)}"
+
+        # 只在啟用權限系統且為超級管理員時註冊
+        if (self.qdrant_settings.enable_permission_system and 
+            self.permission_manager.get_user_permission("default_user") == PermissionLevel.SUPER_ADMIN):
+            self.tool(
+                set_user_permission_level,
+                name="set-user-permission-level",
+                description="設定用戶的權限級別（僅限超級管理員）",
+            )
+
+        # 資料遷移工具集 - 需要管理員權限
+        async def analyze_collection_for_migration(
+            ctx: Context,
+            collection_name: Annotated[str, Field(description="要分析的 collection 名稱")],
+        ) -> list[str]:
+            """
+            分析舊 collection 的結構，為遷移做準備。
+            """
+            await ctx.debug(f"Analyzing collection for migration: {collection_name}")
+            
+            try:
+                analysis = self.migration_tool.analyze_collection_structure(collection_name)
+                
+                output = [
+                    f"📊 **Collection 分析結果**",
+                    f"🏗️ Collection: {analysis['collection_name']}",
+                    f"📦 總點數: {analysis['total_points']:,}",
+                    f"🔢 向量維度: {analysis['vector_size']}",
+                    f"📏 距離度量: {analysis['distance_metric']}",
+                    f"📅 分析時間: {analysis['analyzed_at']}",
+                    "",
+                    f"🗃️ **欄位結構分析:**"
+                ]
+                
+                for field, types in analysis['field_types'].items():
+                    types_str = ', '.join(types)
+                    samples = analysis['field_samples'].get(field, [])
+                    sample_preview = str(samples[0]) if samples else "N/A"
+                    if len(sample_preview) > 50:
+                        sample_preview = sample_preview[:47] + "..."
+                    
+                    output.append(f"  📝 **{field}** ({types_str})")
+                    output.append(f"    範例: {sample_preview}")
+                
+                # 生成建議的遷移計劃
+                suggested_plan = self.migration_tool.suggest_migration_plan(analysis)
+                
+                output.extend([
+                    "",
+                    f"💡 **建議的遷移計劃:**",
+                    f"🎯 目標內容類型: {suggested_plan.target_content_type.value}",
+                    f"📋 預估記錄數: {suggested_plan.estimated_records:,}",
+                    "",
+                    f"🔄 **欄位映射建議:**"
+                ])
+                
+                for old_field, new_field in suggested_plan.mapping_rules.items():
+                    output.append(f"  {old_field} → {new_field}")
+                
+                output.extend([
+                    "",
+                    f"⚙️ **轉換規則:**",
+                    f"  標準化詞彙: {'✅' if suggested_plan.transformation_rules.get('standardize_vocabulary') else '❌'}",
+                    f"  提取關鍵詞: {'✅' if suggested_plan.transformation_rules.get('extract_keywords') else '❌'}",
+                    f"  正規化標籤: {'✅' if suggested_plan.transformation_rules.get('normalize_tags') else '❌'}",
+                    "",
+                    f"💡 **下一步:** 使用 'create-migration-plan' 工具創建正式的遷移計劃"
+                ])
+                
+                return output
+                
+            except Exception as e:
+                logger.error(f"Collection analysis failed: {e}")
+                return [f"❌ Collection 分析失敗: {str(e)}"]
+
+        async def execute_migration_dry_run(
+            ctx: Context,
+            source_collection: Annotated[str, Field(description="來源 collection 名稱")],
+            target_content_type: Annotated[str, Field(description="目標內容類型: experience, process_workflow, knowledge_base, decision_record, vocabulary")],
+            batch_size: Annotated[int, Field(description="批次大小")] = 100,
+        ) -> list[str]:
+            """
+            執行遷移預演（不實際移動資料），檢查遷移可行性。
+            """
+            await ctx.debug(f"Running migration dry run: {source_collection} -> {target_content_type}")
+            
+            try:
+                # 創建遷移計劃
+                analysis = self.migration_tool.analyze_collection_structure(source_collection)
+                plan = self.migration_tool.suggest_migration_plan(analysis)
+                
+                # 更新目標內容類型
+                from mcp_server_qdrant.ragbridge.models import ContentType
+                try:
+                    plan.target_content_type = ContentType(target_content_type)
+                except ValueError:
+                    return [f"❌ 無效的內容類型: {target_content_type}"]
+                
+                # 執行 dry run
+                result = await self.migration_tool.execute_migration(
+                    plan=plan,
+                    dry_run=True,
+                    batch_size=batch_size
+                )
+                
+                output = [
+                    f"🧪 **遷移預演結果**",
+                    f"📋 來源: {result.plan.source_collection}",
+                    f"🎯 目標: {result.plan.target_content_type.value}",
+                    f"⏱️ 執行時間: {result.duration_seconds:.1f} 秒",
+                    "",
+                    f"📊 **處理統計:**",
+                    f"  總記錄數: {result.total_records:,}",
+                    f"  成功處理: {result.successful_records:,}",
+                    f"  處理失敗: {result.failed_records:,}",
+                    f"  成功率: {result.success_rate:.1%}",
+                ]
+                
+                if result.errors:
+                    output.extend([
+                        "",
+                        f"⚠️ **發現的問題 (前10個):**"
+                    ])
+                    for error in result.errors[:10]:
+                        output.append(f"  • {error}")
+                    
+                    if len(result.errors) > 10:
+                        output.append(f"  ... 還有 {len(result.errors) - 10} 個錯誤")
+                
+                # 生成建議
+                report = self.migration_tool.generate_migration_report(result)
+                if report['recommendations']:
+                    output.extend([
+                        "",
+                        f"💡 **建議:**"
+                    ])
+                    for rec in report['recommendations']:
+                        output.append(f"  • {rec}")
+                
+                if result.success_rate >= 0.9:
+                    output.extend([
+                        "",
+                        f"✅ **預演成功！** 可以使用 'execute-migration' 工具執行實際遷移"
+                    ])
+                else:
+                    output.extend([
+                        "",
+                        f"⚠️ **預演發現問題！** 建議先修正問題再執行實際遷移"
+                    ])
+                
+                return output
+                
+            except Exception as e:
+                logger.error(f"Migration dry run failed: {e}")
+                return [f"❌ 遷移預演失敗: {str(e)}"]
+
+        async def execute_data_migration(
+            ctx: Context,
+            source_collection: Annotated[str, Field(description="來源 collection 名稱")],
+            target_content_type: Annotated[str, Field(description="目標內容類型")],
+            create_backup: Annotated[bool, Field(description="是否創建備份")] = True,
+            batch_size: Annotated[int, Field(description="批次大小")] = 100,
+        ) -> list[str]:
+            """
+            執行實際的資料遷移（高風險操作，需要 super_admin 權限）。
+            """
+            await ctx.debug(f"Executing data migration: {source_collection} -> {target_content_type}")
+            
+            try:
+                # 創建遷移計劃
+                analysis = self.migration_tool.analyze_collection_structure(source_collection)
+                plan = self.migration_tool.suggest_migration_plan(analysis)
+                
+                # 更新目標內容類型
+                from mcp_server_qdrant.ragbridge.models import ContentType
+                try:
+                    plan.target_content_type = ContentType(target_content_type)
+                except ValueError:
+                    return [f"❌ 無效的內容類型: {target_content_type}"]
+                
+                # 驗證計劃
+                validation_errors = self.migration_tool.validate_migration_plan(plan)
+                if validation_errors:
+                    return [
+                        f"❌ **遷移計劃驗證失敗:**",
+                        *[f"  • {error}" for error in validation_errors]
+                    ]
+                
+                # 執行遷移
+                result = await self.migration_tool.execute_migration(
+                    plan=plan,
+                    dry_run=False,
+                    batch_size=batch_size
+                )
+                
+                output = [
+                    f"🚀 **資料遷移執行結果**",
+                    f"📋 來源: {result.plan.source_collection}",
+                    f"🎯 目標: {result.plan.target_content_type.value}",
+                    f"⏱️ 執行時間: {result.duration_seconds:.1f} 秒",
+                    "",
+                    f"📊 **遷移統計:**",
+                    f"  總記錄數: {result.total_records:,}",
+                    f"  成功遷移: {result.successful_records:,}",
+                    f"  遷移失敗: {result.failed_records:,}",
+                    f"  成功率: {result.success_rate:.1%}",
+                ]
+                
+                if create_backup:
+                    output.append(f"💾 備份已創建")
+                
+                if result.errors:
+                    output.extend([
+                        "",
+                        f"⚠️ **遷移錯誤 (前10個):**"
+                    ])
+                    for error in result.errors[:10]:
+                        output.append(f"  • {error}")
+                
+                # 生成最終建議
+                if result.success_rate >= 0.95:
+                    output.extend([
+                        "",
+                        f"✅ **遷移成功完成！**",
+                        f"💡 建議使用 'qdrant-list-collections' 檢查新的 collection",
+                        f"⚠️ 如果確認遷移成功，可以考慮移除原始 collection"
+                    ])
+                elif result.success_rate >= 0.8:
+                    output.extend([
+                        "",
+                        f"⚠️ **遷移部分成功**",
+                        f"💡 建議檢查失敗的記錄並考慮重新遷移"
+                    ])
+                else:
+                    output.extend([
+                        "",
+                        f"❌ **遷移失敗率過高**",
+                        f"💡 建議檢查錯誤原因並調整遷移策略"
+                    ])
+                
+                return output
+                
+            except Exception as e:
+                logger.error(f"Data migration failed: {e}")
+                return [f"❌ 資料遷移失敗: {str(e)}"]
+
+        # 註冊遷移工具（需要管理員權限）
+        if not self.qdrant_settings.read_only:
+            self.tool(
+                analyze_collection_for_migration,
+                name="analyze-collection-for-migration",
+                description="分析舊 collection 的結構，為遷移做準備",
+            )
+            
+            self.tool(
+                execute_migration_dry_run,
+                name="execute-migration-dry-run",
+                description="執行遷移預演（不實際移動資料），檢查遷移可行性",
+            )
+            
+            # 實際遷移工具只在非唯讀模式下提供
+            self.tool(
+                execute_data_migration,
+                name="execute-data-migration",
+                description="執行實際的資料遷移（高風險操作，需要管理員權限）",
+            )
+
+        # 環境變數檢查工具
+        async def check_environment_config(ctx: Context) -> list[str]:
+            """
+            檢查系統的環境變數配置，用於調試和驗證設置。
+            """
+            import os
+            from pathlib import Path
+            
+            result = ["🔧 **環境變數配置檢查**", ""]
+            
+            # 檢查 .env 文件路徑
+            package_dir = Path(__file__).parent.parent.parent
+            env_path = package_dir / ".env"
+            result.append(f"📁 **專案根目錄**: {package_dir}")
+            result.append(f"📄 **.env 文件路徑**: {env_path}")
+            result.append(f"✅ **.env 文件存在**: {'是' if env_path.exists() else '否'}")
+            result.append("")
+            
+            # 列出所有相關的環境變數
+            env_vars = {
+                "Qdrant 配置": [
+                    "QDRANT_URL",
+                    "QDRANT_API_KEY", 
+                    "QDRANT_LOCAL_PATH",
+                    "COLLECTION_NAME",
+                    "QDRANT_SEARCH_LIMIT",
+                    "QDRANT_READ_ONLY",
+                    "QDRANT_ALLOW_ARBITRARY_FILTER"
+                ],
+                "權限系統": [
+                    "QDRANT_ENABLE_PERMISSION_SYSTEM",
+                    "QDRANT_DEFAULT_PERMISSION_LEVEL"
+                ],
+                "Embedding 配置": [
+                    "EMBEDDING_PROVIDER",
+                    "EMBEDDING_MODEL",
+                    "OLLAMA_BASE_URL"
+                ],
+                "工具配置": [
+                    "TOOL_STORE_DESCRIPTION",
+                    "TOOL_FIND_DESCRIPTION"
+                ]
+            }
+            
+            for category, vars_list in env_vars.items():
+                result.append(f"📋 **{category}**:")
+                for var in vars_list:
+                    value = os.getenv(var)
+                    if value is not None:
+                        # 對於敏感資訊（如 API KEY）進行遮罩
+                        if "API_KEY" in var or "TOKEN" in var:
+                            display_value = f"{value[:8]}..." if len(value) > 8 else value
+                        else:
+                            display_value = value
+                        result.append(f"   ✅ {var} = {display_value}")
+                    else:
+                        result.append(f"   ❌ {var} = (未設置)")
+                result.append("")
+            
+            # 檢查當前設置物件的實際值
+            result.append("⚙️ **當前設定物件值**:")
+            result.append(f"   📍 Qdrant URL: {self.qdrant_settings.location}")
+            result.append(f"   🔑 API Key: {'已設置' if self.qdrant_settings.api_key else '未設置'}")
+            result.append(f"   📦 Collection: {self.qdrant_settings.collection_name}")
+            result.append(f"   🔍 Search Limit: {self.qdrant_settings.search_limit}")
+            result.append(f"   📖 Read Only: {self.qdrant_settings.read_only}")
+            result.append(f"   🎯 Allow Arbitrary Filter: {self.qdrant_settings.allow_arbitrary_filter}")
+            result.append(f"   🔐 Permission System: {self.qdrant_settings.enable_permission_system}")
+            result.append(f"   👤 Default Permission: {self.qdrant_settings.default_permission_level}")
+            result.append("")
+            result.append(f"   🤖 Embedding Provider: {self.embedding_provider_settings.provider_type}")
+            result.append(f"   📝 Embedding Model: {self.embedding_provider_settings.model_name}")
+            result.append(f"   🌐 Ollama Base URL: {self.embedding_provider_settings.base_url}")
+            
+            return result
+
+        self.tool(
+            check_environment_config,
+            name="qdrant-check-environment",
+            description="檢查系統的環境變數配置，用於調試和驗證 .env 文件是否正確載入",
+        )
+
+        # Collection 配置管理工具
+        async def list_collection_configs(ctx: Context) -> list[str]:
+            """
+            列出所有 collection 的配置信息
+            """
+            from mcp_server_qdrant.dynamic_embedding_manager import get_dynamic_embedding_manager
+            
+            result = ["📋 **Collection 配置列表**", ""]
+            
+            try:
+                manager = get_dynamic_embedding_manager()
+                configs = manager.list_collection_configs()
+                
+                if not configs:
+                    result.append("❌ 沒有找到任何 collection 配置")
+                    return result
+                
+                for name, config in configs.items():
+                    result.append(f"📁 **{name}**")
+                    result.append(f"   🤖 Provider: {config.embedding_provider.value}")
+                    result.append(f"   📝 Model: {config.embedding_model}")
+                    result.append(f"   🏷️ Vector Name: {config.vector_name}")
+                    result.append(f"   📏 Vector Size: {config.vector_size}")
+                    if config.ollama_base_url:
+                        result.append(f"   🌐 Ollama URL: {config.ollama_base_url}")
+                    if config.description:
+                        result.append(f"   📄 Description: {config.description}")
+                    result.append("")
+                
+                return result
+                
+            except Exception as e:
+                logger.error(f"Failed to list collection configs: {e}")
+                return [f"❌ 獲取配置列表失敗: {str(e)}"]
+
+        async def validate_collection_config(ctx: Context, collection_name: str) -> list[str]:
+            """
+            驗證指定 collection 的配置和兼容性
+            """
+            from mcp_server_qdrant.dynamic_embedding_manager import get_dynamic_embedding_manager
+            
+            result = [f"🔍 **Collection '{collection_name}' 驗證結果**", ""]
+            
+            try:
+                manager = get_dynamic_embedding_manager()
+                validation = manager.validate_collection_compatibility(collection_name)
+                
+                # 基本信息
+                result.append("📊 **基本信息**")
+                result.append(f"   📁 Collection: {validation['collection_name']}")
+                result.append(f"   ⚙️ 配置存在: {'✅' if validation['config_exists'] else '❌'}")
+                result.append(f"   🔌 Provider 可用: {'✅' if validation['provider_available'] else '❌'}")
+                result.append("")
+                
+                # 向量信息
+                if validation.get('actual_vector_name'):
+                    result.append("🎯 **向量信息**")
+                    result.append(f"   🏷️ Vector Name: {validation['actual_vector_name']} "
+                                f"({'✅' if validation['vector_name_match'] else '❌'})")
+                    result.append(f"   📏 Vector Size: {validation['actual_vector_size']} "
+                                f"({'✅' if validation['vector_size_match'] else '❌'})")
+                    result.append("")
+                
+                # 警告
+                if validation['warnings']:
+                    result.append("⚠️ **警告**")
+                    for warning in validation['warnings']:
+                        result.append(f"   • {warning}")
+                    result.append("")
+                
+                # 錯誤
+                if validation['errors']:
+                    result.append("❌ **錯誤**")
+                    for error in validation['errors']:
+                        result.append(f"   • {error}")
+                    result.append("")
+                
+                # 總結
+                result.append(f"📋 **總結**: {'✅ 配置有效' if validation['is_valid'] else '❌ 配置有問題'}")
+                
+                return result
+                
+            except Exception as e:
+                logger.error(f"Failed to validate collection config: {e}")
+                return [f"❌ 驗證失敗: {str(e)}"]
+
+        async def get_collection_detailed_info(ctx: Context, collection_name: str) -> list[str]:
+            """
+            獲取 collection 的詳細信息，包括 Qdrant 狀態和配置信息
+            """
+            from mcp_server_qdrant.collection_aware_qdrant import CollectionAwareQdrantConnector
+            
+            result = [f"📊 **Collection '{collection_name}' 詳細信息**", ""]
+            
+            try:
+                # 創建 collection-aware connector
+                connector = CollectionAwareQdrantConnector(
+                    qdrant_url=self.qdrant_settings.location,
+                    qdrant_api_key=self.qdrant_settings.api_key,
+                    qdrant_local_path=self.qdrant_settings.local_path,
+                )
+                
+                # 獲取詳細信息
+                info = await connector.get_collection_info(collection_name)
+                
+                if info is None:
+                    result.append(f"❌ Collection '{collection_name}' 不存在")
+                    return result
+                
+                # Qdrant 統計
+                result.append("📈 **Qdrant 統計**")
+                result.append(f"   📄 Documents: {info['points_count']:,}")
+                result.append(f"   🔍 Indexed Vectors: {info['indexed_vectors_count']:,}")
+                result.append(f"   📊 Status: {info['status']}")
+                result.append("")
+                
+                # 向量配置
+                result.append("🎯 **向量配置**")
+                for vector_name, vector_config in info['vectors_config'].items():
+                    result.append(f"   🏷️ {vector_name}: {vector_config.size}維, {vector_config.distance}")
+                result.append("")
+                
+                # Embedding 配置
+                if 'embedding_config' in info:
+                    config = info['embedding_config']
+                    result.append("🤖 **Embedding 配置**")
+                    result.append(f"   🔌 Provider: {config['provider']}")
+                    result.append(f"   📝 Model: {config['model']}")
+                    result.append(f"   🏷️ Vector Name: {config['vector_name']}")
+                    result.append(f"   📏 Vector Size: {config['vector_size']}")
+                    result.append("")
+                
+                return result
+                
+            except Exception as e:
+                logger.error(f"Failed to get collection info: {e}")
+                return [f"❌ 獲取信息失敗: {str(e)}"]
+
+        # 註冊 collection 管理工具
+        self.tool(
+            list_collection_configs,
+            name="qdrant-list-collection-configs",
+            description="列出所有 collection 的 embedding 配置信息",
+        )
+        
+        self.tool(
+            validate_collection_config,
+            name="qdrant-validate-collection",
+            description="驗證指定 collection 的配置和兼容性",
+        )
+        
+        self.tool(
+            get_collection_detailed_info,
+            name="qdrant-collection-info",
+            description="獲取 collection 的詳細信息，包括 Qdrant 狀態和 embedding 配置",
+        )

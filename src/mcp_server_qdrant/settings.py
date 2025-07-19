@@ -88,6 +88,18 @@ class QdrantSettings(BaseSettings):
     local_path: str | None = Field(default=None, validation_alias="QDRANT_LOCAL_PATH")
     search_limit: int = Field(default=10, validation_alias="QDRANT_SEARCH_LIMIT")
     read_only: bool = Field(default=False, validation_alias="QDRANT_READ_ONLY")
+    
+    # 權限管理設定
+    default_permission_level: str = Field(
+        default="user", 
+        validation_alias="QDRANT_DEFAULT_PERMISSION_LEVEL",
+        description="預設權限級別: user, admin, super_admin"
+    )
+    enable_permission_system: bool = Field(
+        default=True, 
+        validation_alias="QDRANT_ENABLE_PERMISSION_SYSTEM",
+        description="是否啟用權限管理系統"
+    )
 
     filterable_fields: list[FilterableField] | None = Field(default=None)
 

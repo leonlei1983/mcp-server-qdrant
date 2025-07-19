@@ -1,0 +1,19 @@
+{
+  "collections": {
+    "default": {
+      "embedding_provider": "fastembed",
+      "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+      "vector_name": "fast-all-minilm-l6-v2",
+      "vector_size": 384,
+      "description": "Legacy collection using FastEmbed with all-MiniLM-L6-v2"
+    },
+    "ragbridge_default": {
+      "embedding_provider": "ollama",
+      "embedding_model": "nomic-embed-text",
+      "vector_name": "ollama-nomic-embed-text",
+      "vector_size": 768,
+      "ollama_base_url": "http://localhost:11434",
+      "description": "Modern collection using Ollama with nomic-embed-text"
+    }
+  }
+}

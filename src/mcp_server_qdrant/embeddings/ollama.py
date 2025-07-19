@@ -63,9 +63,9 @@ class OllamaProvider(EmbeddingProvider):
 
     def get_vector_name(self) -> str:
         """Return the name of the vector for the Qdrant collection."""
-        # Normalize model name for Qdrant vector name
-        model_name = self.model_name.replace("-", "_").replace(":", "_").lower()
-        return f"ollama_{model_name}"
+        # Normalize model name for Qdrant vector name (consistent with fastembed style)
+        model_name = self.model_name.replace("_", "-").replace(":", "-").lower()
+        return f"ollama-{model_name}"
 
     def get_vector_size(self) -> int:
         """Get the size of the vector for the Qdrant collection."""
